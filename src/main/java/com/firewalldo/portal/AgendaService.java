@@ -25,7 +25,7 @@ class AgendaService {
 
     record Rule(String title,String description,UUID project,String category,String priority,List<UUID> members,
                 String kind,int interval,LocalDate start,LocalDate end,LocalTime time,List<Integer> weekdays,
-                List<LocalDate> dates,int deadline,String checklist) {
+                List<LocalDate> dates,int deadline,String checklist,String initialStatus,int maxAssignees) {
         Instant next(Instant from,boolean inclusive) {
             LocalDate first=from.atZone(ZONE).toLocalDate();
             if(first.isBefore(start))first=start;
@@ -52,9 +52,12 @@ class AgendaService {
     Rule rule(JsonNode body,boolean validateMembers) {
         var f=new Input(body);
         f.only("title","description","projectId","category","priority","assigneeIds","kind","intervalDays",
-          "startDate","endDate","openingTime","weekdays","dates","deadlineDays","checklist");
+          "startDate","endDate","openingTime","weekdays","dates","deadlineDays","checklist","initialStatus","maxAssignees");
         var members=f.ids("assigneeIds");
-        if(members.isEmpty())throw ApiError.invalid("Vincule pelo menos uma pessoa à agenda.");
+        String status=f.has("initialStatus")?f.choice("initialStatus","backlog","a_fazer"):"a_fazer";
+        int max=f.has("maxAssignees")?f.number("maxAssignees",1,100):Math.max(1,members.size());
+        if(status.equals("a_fazer") && members.isEmpty())throw ApiError.invalid("Vincule pelo menos uma pessoa ou escolha Backlog para receber aceites.");
+        if(status.equals("a_fazer"))max=Math.max(max,members.size());
         if(validateMembers)db.validateMembers(members);
         UUID project=f.optionalId("projectId");
         if(project!=null && validateMembers)db.require("Projeto não encontrado.","SELECT to_jsonb(id) FROM projects WHERE id=?",project);
@@ -78,7 +81,7 @@ class AgendaService {
         Input.unique(keys);
         return new Rule(f.text("title",3,200),f.text("description",0,12000),project,f.choice("category",Input.AREAS),
           f.choice("priority","baixa","media","alta","critica"),members,kind,interval,start,end,time,days,dates,
-          f.number("deadlineDays",0,365),checklist.toString());
+          f.number("deadlineDays",0,365),checklist.toString(),status,max);
     }
 
     @Scheduled(initialDelayString="${AGENDA_INITIAL_DELAY_MS:15000}",fixedDelayString="${AGENDA_INTERVAL_MS:15000}")
@@ -102,25 +105,37 @@ class AgendaService {
             var active=db.sql.queryForList("SELECT id FROM members WHERE active AND id=ANY(?::uuid[]) ORDER BY id FOR SHARE",UUID.class,Store.array(r.members));
             for(int batch=0;batch<20 && release!=null && !release.isAfter(now);batch++) {
                 LocalDate date=release.atZone(ZONE).toLocalDate();
-                for(UUID member:active) {
+                boolean backlog=r.initialStatus.equals("backlog");
+                // One occurrence for the whole team, not a random/individual recipient.
+                // A previously released legacy occurrence also counts, even if its task was deleted.
+                if(backlog || !active.isEmpty()) {
                     UUID runId=UUID.randomUUID(),task=UUID.randomUUID();
-                    int inserted=db.sql.update("INSERT INTO task_schedule_runs(id,schedule_id,scheduled_for,member_id) VALUES(?,?,?,?) ON CONFLICT(schedule_id,scheduled_for,member_id) DO NOTHING",runId,scheduleId,Timestamp.from(release),member);
-                    if(inserted==0)continue;
-                    db.sql.update("""
-                      INSERT INTO tasks(id,title,description,project_id,category,status,priority,assignee_ids,open,max_assignees,
-                        due_date,checklist,created_by,created_at,updated_at,position,schedule_id,scheduled_for,schedule_member_id)
-                      VALUES(?,?,?,?,?,'a_fazer',?,?::uuid[],false,1,?,?::jsonb,?,?,?,
-                        (SELECT COALESCE(max(position),0)+1 FROM tasks WHERE status='a_fazer'),?,?,?)
-                      """,task,r.title,r.description,r.project,r.category,r.priority,Store.array(List.of(member)),date.plusDays(r.deadline),
-                      r.checklist,creator,date,now.atZone(ZONE).toLocalDate(),scheduleId,Timestamp.from(release),member);
-                    db.sql.update("UPDATE task_schedule_runs SET task_id=? WHERE id=?",task,runId);
-                    db.sql.update("""
-                      INSERT INTO notifications(id,member_id,kind,title,description,dedup_key)
-                      SELECT gen_random_uuid(),?,'tarefa','Tarefa da agenda liberada',?,?
-                      WHERE COALESCE((SELECT (preferences#>>'{notifications,taskAssigned}')::boolean FROM member_preferences WHERE member_id=?),true)
-                      ON CONFLICT(dedup_key) DO NOTHING
-                      """,member,r.title,"agenda:"+runId,member);
-                    created++;
+                    int inserted=db.sql.update("""
+                      INSERT INTO task_schedule_runs(id,schedule_id,scheduled_for,member_id)
+                      SELECT ?,?,?,NULL WHERE NOT EXISTS
+                        (SELECT 1 FROM task_schedule_runs WHERE schedule_id=? AND scheduled_for=?)
+                      ON CONFLICT DO NOTHING
+                      """,runId,scheduleId,Timestamp.from(release),scheduleId,Timestamp.from(release));
+                    if(inserted>0) {
+                        db.sql.update("""
+                          INSERT INTO tasks(id,title,description,project_id,category,status,priority,assignee_ids,eligible_assignee_ids,open,max_assignees,
+                            due_date,checklist,created_by,created_at,updated_at,position,schedule_id,scheduled_for,schedule_member_id)
+                          VALUES(?,?,?,?,?,?,?,?::uuid[],?::uuid[],?,?,?,?::jsonb,?,?,?,
+                            (SELECT COALESCE(max(position),0)+1 FROM tasks WHERE status=?),?,?,NULL)
+                          """,task,r.title,r.description,r.project,r.category,r.initialStatus,r.priority,
+                          Store.array(backlog?List.of():active),Store.array(backlog?r.members:List.of()),backlog,r.maxAssignees,date.plusDays(r.deadline),
+                          r.checklist,creator,date,now.atZone(ZONE).toLocalDate(),r.initialStatus,scheduleId,Timestamp.from(release));
+                        db.sql.update("UPDATE task_schedule_runs SET task_id=? WHERE id=?",task,runId);
+                        db.sql.update("""
+                          INSERT INTO notifications(id,member_id,kind,title,description,dedup_key)
+                          SELECT gen_random_uuid(),m.id,'tarefa',?,?,'agenda:'||?||':'||m.id FROM members m
+                          WHERE m.active AND (m.id=ANY(?::uuid[]) OR (? AND cardinality(?::uuid[])=0))
+                            AND COALESCE((SELECT (preferences#>>'{notifications,taskAssigned}')::boolean FROM member_preferences WHERE member_id=m.id),true)
+                          ON CONFLICT(dedup_key) DO NOTHING
+                          """,backlog?"Tarefa da agenda disponível para aceitar":"Tarefa da agenda liberada",r.title,runId.toString(),
+                          Store.array(backlog?r.members:active),backlog,Store.array(r.members));
+                        created++;
+                    }
                 }
                 release=r.next(release,false);
             }

@@ -155,3 +155,10 @@ Migração `V8__portal_v19.sql` é aditiva: não apaga dados. Desliga `radar_set
 O editor usa campos separados e não permite preencher `assigneeIds` manualmente no Backlog. Para clientes antigos, ao criar uma tarefa de Backlog sem `eligibleAssigneeIds`, a antiga seleção de `assigneeIds` é interpretada como lista de candidatos e os aceites começam vazios. Nas tarefas já em execução, `assigneeIds` continua sendo a equipe responsável.
 
 A migração V10 adiciona a lista de candidatos e abre inscrições de tarefas antigas no Backlog que estavam fechadas indevidamente. Preserva os aceites e tickets existentes. Tarefas antigas de Backlog que já estavam com todas as vagas preenchidas seguem para A fazer. Migrações V1–V9 permanecem intactas.
+
+
+## Portal 1.1.12 — Agenda compartilhada
+
+A Agenda aceita `initialStatus` (`backlog` ou `a_fazer`) e `maxAssignees` (1–100). Uma ocorrência gera uma única tarefa para toda a equipe: em A fazer, `assigneeIds` da regra é a equipe atribuída; no Backlog, vira `eligibleAssigneeIds` da tarefa, com zero aceites iniciais. A tarefa só passa para A fazer ao completar o número de aceites, usando o mesmo bloqueio transacional e regras das tarefas manuais. Uma lista vazia no Backlog permite qualquer conta ativa. As listagens mostram a equipe completa.
+
+V11 permite ocorrências compartilhadas sem `schedule_member_id` e adiciona índices únicos para impedir lançamento duplicado. Preserva tarefas individuais antigas, tickets e registros de execução, inclusive de tarefas excluídas. Regras antigas continuam em A fazer e passam a gerar uma tarefa com todos os vinculados nas próximas aberturas. O DTO `scheduleIndividual` identifica apenas as ocorrências históricas que continuam com atribuição individual fixa. Edite a regra para mudar as próximas aberturas, ou a tarefa para mudar uma ocorrência compartilhada. Migrações V1–V10 ficam intactas.

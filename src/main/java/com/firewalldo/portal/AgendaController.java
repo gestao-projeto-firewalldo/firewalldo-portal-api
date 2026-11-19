@@ -20,7 +20,7 @@ class AgendaController {
     @GetMapping
     List<JsonNode> list(@RequestAttribute Actor actor){
         var rows=actor.admin()?db.list(AgendaService.SELECT+" WHERE NOT s.deleted ORDER BY s.created_at DESC,s.id"):
-          db.list(AgendaService.SELECT+" WHERE NOT s.deleted AND s.config->'assigneeIds' @> ?::jsonb ORDER BY s.created_at DESC,s.id","[\""+actor.id()+"\"]");
+          db.list(AgendaService.SELECT+" WHERE NOT s.deleted AND (s.config->'assigneeIds' @> ?::jsonb OR (s.config->>'initialStatus'='backlog' AND jsonb_array_length(s.config->'assigneeIds')=0)) ORDER BY s.created_at DESC,s.id","[\""+actor.id()+"\"]");
         for(JsonNode row:rows) {
             ObjectNode result=(ObjectNode)row;
             ObjectNode config=result.deepCopy();
@@ -31,7 +31,6 @@ class AgendaController {
                 Instant time=OffsetDateTime.parse(row.path("nextRunAt").asText()).toInstant();
                 for(int i=0;i<6 && time!=null;i++) {upcoming.add(time.toString());time=rule.next(time,false);}
             }
-            if(!actor.admin())result.putArray("assigneeIds").add(actor.id().toString());
         }
         return rows;
     }

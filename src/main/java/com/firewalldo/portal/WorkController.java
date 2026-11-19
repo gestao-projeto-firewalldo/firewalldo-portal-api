@@ -28,7 +28,7 @@ class WorkController {
         SELECT jsonb_build_object('id', t.id, 'title', t.title, 'description', t.description, 'projectId', t.project_id,
           'category', t.category, 'status', t.status, 'priority', t.priority, 'assigneeIds', t.assignee_ids, 'open', t.open,
           'maxAssignees', t.max_assignees, 'eligibleAssigneeIds', t.eligible_assignee_ids, 'dueDate', t.due_date, 'checklist', t.checklist, 'createdBy', t.created_by,
-          'createdAt', t.created_at, 'updatedAt', t.updated_at, 'order', t.position, 'ticketNumber',t.ticket_number,'scheduleId',t.schedule_id,'scheduledFor',t.scheduled_for)
+          'createdAt', t.created_at, 'updatedAt', t.updated_at, 'order', t.position, 'ticketNumber',t.ticket_number,'scheduleId',t.schedule_id,'scheduledFor',t.scheduled_for,'scheduleIndividual',t.schedule_member_id IS NOT NULL)
         FROM tasks t
         """;
     private final Store db;
@@ -214,7 +214,7 @@ class WorkController {
             var data = taskData(new Input(current), oldAssignees);
             if (oldStatus.equals("backlog") && !data.assignees.equals(oldAssignees))
                 throw ApiError.invalid("No Backlog, selecione quem pode aceitar. Os responsáveis são definidos pelos aceites.");
-            if(!current.path("scheduleId").isNull() && (!data.assignees.equals(oldAssignees) || !data.eligible.isEmpty() || data.open || data.max!=1))
+            if(current.path("scheduleIndividual").asBoolean() && (!data.assignees.equals(oldAssignees) || !data.eligible.isEmpty() || data.open || data.max!=1))
                 throw ApiError.invalid("A tarefa da Agenda é individual. Edite os responsáveis na Agenda para as próximas aberturas.");
             db.sql.update("""
                 UPDATE tasks SET title = ?, description = ?, project_id = ?, category = ?, status = ?, priority = ?,
@@ -280,7 +280,7 @@ class WorkController {
         UUID taskId = Input.id(id);
         db.lock(TASK_LOCK);
         var current = new Input(task(taskId));
-        if(!current.value().path("scheduleId").isNull())throw ApiError.invalid("A atribuição desta tarefa é definida pela Agenda.");
+        if(current.value().path("scheduleIndividual").asBoolean())throw ApiError.invalid("A atribuição desta tarefa individual é definida pela Agenda.");
         var assignees = current.ids("assigneeIds");
         if(!actor.admin()&&!assignees.contains(actor.id()))throw ApiError.forbidden();
         if (assignees.remove(actor.id())) {
