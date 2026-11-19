@@ -18,9 +18,9 @@ class WorkController {
     private static final long TASK_LOCK = 470003;
     private static final String PROJECT = """
         SELECT jsonb_build_object('id', p.id, 'name', p.name, 'subtitle', p.subtitle,
-          'description', p.description, 'icon', p.icon, 'color', p.color, 'status', p.status,
+          'category', p.category, 'brand', p.brand, 'description', p.description, 'icon', p.icon, 'color', p.color, 'status', p.status,
           'ownerIds', p.owner_ids, 'milestones', p.milestones, 'startDate', p.start_date, 'dueDate', p.due_date,
-          'progress', COALESCE(round(100 * stats.done::numeric / NULLIF(stats.total, 0)), p.progress))
+          'progress', COALESCE(round(100 * stats.done::numeric / NULLIF(stats.total, 0)), CASE WHEN p.status='concluido' THEN 100 ELSE COALESCE((SELECT round(100.0*count(*) FILTER(WHERE (m->>'done')::boolean)/NULLIF(count(*),0)) FROM jsonb_array_elements(p.milestones) m),0) END))
         FROM projects p CROSS JOIN LATERAL (
           SELECT count(*) AS total, count(*) FILTER (WHERE status = 'concluido') AS done FROM tasks WHERE project_id = p.id
         ) stats
@@ -29,7 +29,7 @@ class WorkController {
         SELECT jsonb_build_object('id', t.id, 'title', t.title, 'description', t.description, 'projectId', t.project_id,
           'category', t.category, 'status', t.status, 'priority', t.priority, 'assigneeIds', t.assignee_ids, 'open', t.open,
           'maxAssignees', t.max_assignees, 'dueDate', t.due_date, 'checklist', t.checklist, 'createdBy', t.created_by,
-          'createdAt', t.created_at, 'updatedAt', t.updated_at, 'order', t.position)
+          'createdAt', t.created_at, 'updatedAt', t.updated_at, 'order', t.position, 'ticketNumber',t.ticket_number,'scheduleId',t.schedule_id,'scheduledFor',t.scheduled_for)
         FROM tasks t
         """;
     private final Store db;
@@ -67,13 +67,45 @@ class WorkController {
         }
         UUID id = UUID.randomUUID();
         db.sql.update("""
-            INSERT INTO projects (id, name, subtitle, description, icon, color, owner_ids, start_date, due_date, milestones)
-            VALUES (?, ?, ?, ?, ?, ?, ?::uuid[], ?, ?, ?::jsonb)
+            INSERT INTO projects (id, name, subtitle, description, icon, color, owner_ids, start_date, due_date, milestones, status, category, brand)
+            VALUES (?, ?, ?, ?, ?, ?, ?::uuid[], ?, ?, ?::jsonb, ?, ?, ?)
             """, id, form.text("name", 3, 150), form.text("subtitle", 0, 250), form.text("description", 0, 8000),
             form.choice("icon", "code", "layout", "smartphone", "play", "globe", "palette", "shield", "server"),
-            color, Store.array(owners), Input.today(), form.date("dueDate"), milestones.toString());
-        return project(id);
+            color, Store.array(owners), Input.today(), form.date("dueDate"), milestones.toString(), form.has("status")?form.choice("status","planejamento","em_andamento","pausado","concluido"):"planejamento", projectCategory(form), form.has("brand")?form.text("brand",0,140):"");
+        var created=project(id);
+        notifyProject(actor,created);
+        return created;
     }
+
+    @PatchMapping("/projects/{id}")
+    @Transactional
+    JsonNode updateProject(@RequestAttribute Actor actor,@PathVariable String id,@RequestBody JsonNode body) {
+        actor.requireAdmin();
+        UUID uuid=Input.id(id);
+        new Input(body).only("name","subtitle","description","icon","color","status","ownerIds","dueDate","milestones","category","brand");
+        db.require("Projeto não encontrado.","SELECT to_jsonb(id) FROM projects WHERE id=? FOR UPDATE",uuid);
+        var before=project(uuid);
+        var merged=((ObjectNode)before).deepCopy(); merged.setAll((ObjectNode)body);
+        var form=new Input(merged);
+        var owners=form.ids("ownerIds");db.validateMembers(owners);
+        String color=form.text("color",7,7);if (!color.matches("#[0-9a-fA-F]{6}")) throw ApiError.invalid("Cor inválida.");
+        var milestones=json.createArrayNode();
+        for (var milestone:Input.list(merged.path("milestones"),50,Input::new)) {
+            milestones.addObject().put("id",milestone.has("id")?milestone.key("id"):UUID.randomUUID().toString())
+              .put("title",milestone.text("title",1,200)).put("dueDate",milestone.date("dueDate").toString()).put("done",milestone.bool("done"));
+        }
+        Input.unique(java.util.stream.StreamSupport.stream(milestones.spliterator(),false).map(m->m.path("id").asText()).toList());
+        db.sql.update("""
+          UPDATE projects SET name=?,subtitle=?,description=?,icon=?,color=?,status=?,owner_ids=?::uuid[],due_date=?,milestones=?::jsonb,category=?,brand=? WHERE id=?
+          """,form.text("name",3,150),form.text("subtitle",0,250),form.text("description",0,8000),
+          form.choice("icon","code","layout","smartphone","play","globe","palette","shield","server"),color,
+          form.choice("status","planejamento","em_andamento","pausado","concluido"),Store.array(owners),form.date("dueDate"),milestones.toString(),projectCategory(form),form.text("brand",0,140),uuid);
+        var updated=project(uuid);
+        if (!updated.equals(before)) notifyProject(actor,updated);
+        return updated;
+    }
+
+    private String projectCategory(Input form) { return !form.has("category") || form.value().path("category").isNull() ? null : form.choice("category", Input.AREAS); }
 
     @PatchMapping("/projects/{id}/milestones/{milestoneId}")
     @Transactional
@@ -85,16 +117,22 @@ class WorkController {
             if (milestone.path("id").asText().equals(milestoneId)) {
                 ((ObjectNode) milestone).put("done", !milestone.path("done").asBoolean());
                 db.sql.update("UPDATE projects SET milestones = ?::jsonb WHERE id = ?", milestones.toString(), projectId);
-                return project(projectId);
+                var updated=project(projectId);
+                notifyProject(actor,updated);
+                return updated;
             }
         }
         throw ApiError.missing("Marco não encontrado.");
     }
 
     @GetMapping("/tasks")
-    List<JsonNode> tasks(@RequestParam(required = false) String projectId,
+    List<JsonNode> tasks(@RequestAttribute Actor actor, @RequestParam(required = false) String projectId,
                          @RequestParam(required = false) String assigneeId,
                          @RequestParam(required = false) String status) {
+        if(!actor.admin()) {
+            if(assigneeId!=null && !Input.id(assigneeId).equals(actor.id()))throw ApiError.forbidden();
+            assigneeId=actor.id().toString();
+        }
         return db.list(TASK + """
             WHERE (?::uuid IS NULL OR t.project_id = ?::uuid)
               AND (?::uuid IS NULL OR ?::uuid = ANY(t.assignee_ids))
@@ -121,6 +159,11 @@ class WorkController {
             """, id, data.title, data.description, data.project, data.category, data.status, data.priority,
             Store.array(data.assignees), data.open, data.max, data.due, data.checklist, actor.id(), date, date, endOf(data.status));
         notifyAssignees(actor.id(), data.title, data.assignees);
+        if(data.open) db.sql.update("""
+          INSERT INTO notifications(id,member_id,kind,title,description)
+          SELECT gen_random_uuid(),m.id,'tarefa','Nova tarefa disponível',? FROM members m WHERE m.active AND m.id<>?
+          AND NOT (m.id=ANY(?::uuid[])) AND COALESCE((SELECT (preferences#>>'{notifications,taskAssigned}')::boolean FROM member_preferences WHERE member_id=m.id),true)
+          """,data.title,actor.id(),Store.array(data.assignees));
         return task(id);
     }
 
@@ -148,6 +191,8 @@ class WorkController {
             List<UUID> oldAssignees = new Input(current).ids("assigneeIds");
             current.setAll((ObjectNode) body);
             var data = taskData(new Input(current), oldAssignees);
+            if(!current.path("scheduleId").isNull() && (!data.assignees.equals(oldAssignees) || data.open || data.max!=1))
+                throw ApiError.invalid("A tarefa da Agenda é individual. Edite os responsáveis na Agenda para as próximas aberturas.");
             db.sql.update("""
                 UPDATE tasks SET title = ?, description = ?, project_id = ?, category = ?, status = ?, priority = ?,
                   assignee_ids = ?::uuid[], open = ?, max_assignees = ?, due_date = ?, checklist = ?::jsonb,
@@ -208,7 +253,9 @@ class WorkController {
         UUID taskId = Input.id(id);
         db.lock(TASK_LOCK);
         var current = new Input(task(taskId));
+        if(!current.value().path("scheduleId").isNull())throw ApiError.invalid("A atribuição desta tarefa é definida pela Agenda.");
         var assignees = current.ids("assigneeIds");
+        if(!actor.admin()&&!assignees.contains(actor.id()))throw ApiError.forbidden();
         if (assignees.remove(actor.id())) {
             db.sql.update("UPDATE tasks SET assignee_ids = ?::uuid[], updated_at = ? WHERE id = ?",
                 Store.array(assignees), Input.today(), taskId);
@@ -257,7 +304,7 @@ class WorkController {
         if (ids.size() > max) throw ApiError.invalid("O número de responsáveis excede o limite de vagas.");
         boolean open = form.bool("open") && ids.size() < max;
         return new TaskData(form.text("title", 3, 200), form.text("description", 0, 12000),
-            project, form.choice("category", Input.AREAS), form.choice("status", Input.TASK_STATUS),
+            project, form.has("category") ? form.choice("category", Input.AREAS) : project != null && !project(project).path("category").isNull() ? project(project).path("category").asText() : "programacao", form.choice("status", Input.TASK_STATUS),
             form.choice("priority", "baixa", "media", "alta", "critica"), ids, open, max,
             form.optionalDate("dueDate"), checklist(form.value().path("checklist")));
     }
@@ -274,8 +321,18 @@ class WorkController {
     private void notifyAssignees(UUID actor, String title, List<UUID> ids) {
         for (UUID member : ids) {
             if (!member.equals(actor)) db.sql.update(
-                "INSERT INTO notifications (id, member_id, kind, title, description) VALUES (?, ?, 'tarefa', 'Nova tarefa atribuída', ?)",
-                UUID.randomUUID(), member, title);
+                "INSERT INTO notifications (id, member_id, kind, title, description) SELECT ?, ?, 'tarefa', 'Nova tarefa atribuída', ? WHERE COALESCE((SELECT (preferences#>>'{notifications,taskAssigned}')::boolean FROM member_preferences WHERE member_id=?),true)",
+                UUID.randomUUID(), member, title, member);
         }
     }
+    private void notifyProject(Actor actor,JsonNode project) {
+        UUID projectId=Input.id(project.path("id").asText());
+        var ids=db.sql.queryForList("""
+          SELECT DISTINCT m.id FROM members m WHERE m.active AND m.id<>? AND
+          (m.id=ANY(?::uuid[]) OR EXISTS(SELECT 1 FROM tasks t WHERE t.project_id=? AND m.id=ANY(t.assignee_ids)))
+          AND COALESCE((SELECT (preferences#>>'{notifications,projectUpdates}')::boolean FROM member_preferences WHERE member_id=m.id),true)
+          """,UUID.class,actor.id(),Store.array(new Input(project).ids("ownerIds")),projectId);
+        for (UUID id:ids) db.sql.update("INSERT INTO notifications(id,member_id,kind,title,description) VALUES(?,?,'projeto','Projeto atualizado',?)",UUID.randomUUID(),id,project.path("name").asText());
+    }
+
 }

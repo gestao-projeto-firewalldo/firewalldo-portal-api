@@ -24,7 +24,7 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 class SessionService implements ApplicationRunner {
     static final long ADMIN_LOCK = 470002;
-    static final String ACTIVE_ADMIN = "role = 'admin' AND active AND password_hash IS NOT NULL";
+    static final String ACTIVE_ADMIN = "role IN ('superadmin', 'admin') AND active AND password_hash IS NOT NULL";
     static final String MEMBER = """
         jsonb_build_object('id', m.id, 'name', m.name, 'email', m.email,
           'initials', upper(left(split_part(m.name, ' ', 1), 1) || left(split_part(m.name, ' ', 2), 1)),
@@ -59,12 +59,20 @@ class SessionService implements ApplicationRunner {
     @Transactional
     public void run(ApplicationArguments args) {
         db.lock(ADMIN_LOCK);
-        if (db.first("SELECT to_jsonb(id) FROM members WHERE " + ACTIVE_ADMIN + " LIMIT 1") != null) return;
+        if (db.first("SELECT to_jsonb(id) FROM members WHERE role = 'superadmin' AND active AND password_hash IS NOT NULL LIMIT 1") != null) return;
+        var admins = db.list("SELECT to_jsonb(m) FROM members m WHERE " + ACTIVE_ADMIN + " ORDER BY id");
+        if (!admins.isEmpty()) {
+            var primary = admins.stream().filter(m -> m.path("email").asText().equalsIgnoreCase(adminEmail.strip())).findFirst()
+                .orElse(admins.size() == 1 ? admins.get(0) : null);
+            if (primary == null) throw new IllegalStateException("ADMIN_EMAIL deve identificar o administrador inicial para promover a administrador geral.");
+            db.sql.update("UPDATE members SET role = 'superadmin' WHERE id = ?", Input.id(primary.path("id").asText()));
+            return;
+        }
         if (adminPassword.length() < 12 || adminPassword.length() > 128 || adminName.isBlank()
             || adminName.length() > 100 || adminEmail.isBlank()) {
             throw new IllegalStateException("Configure ADMIN_EMAIL e ADMIN_PASSWORD (12 a 128 caracteres).");
         }
-        db.sql.update("INSERT INTO members (id, email, password_hash, name, role) VALUES (?, ?, ?, ?, 'admin')",
+        db.sql.update("INSERT INTO members (id, email, password_hash, name, role) VALUES (?, ?, ?, ?, 'superadmin')",
             UUID.randomUUID(), email(adminEmail), encoder.encode(adminPassword), adminName.strip());
     }
 
@@ -77,7 +85,8 @@ class SessionService implements ApplicationRunner {
     }
 
     record Actor(UUID id, String role) {
-        boolean admin() { return role.equals("admin"); }
+        boolean general() { return role.equals("superadmin"); }
+        boolean admin() { return general() || role.equals("admin"); }
         void requireAdmin() { if (!admin()) throw ApiError.forbidden(); }
     }
 
@@ -112,6 +121,13 @@ class SessionService implements ApplicationRunner {
         db.sql.update("INSERT INTO sessions VALUES (?, ?, now() + interval '7 days')", digest(token), id);
         db.sql.update("UPDATE members SET last_seen = now() WHERE id = ?", id);
         return new Login(member(id), cookie(token, SESSION_AGE));
+    }
+
+    String hashPassword(String password) { return encoder.encode(password); }
+
+    void verifyPassword(JsonNode member, String password) {
+        String hash = member.path("password_hash").textValue();
+        if (hash == null || !encoder.matches(password, hash)) throw ApiError.invalid("A senha atual está incorreta.");
     }
 
     JsonNode member(UUID id) {
@@ -161,6 +177,9 @@ class SessionService implements ApplicationRunner {
             || db.sql.update("DELETE FROM invitations WHERE token_hash = ? AND expires_at > now()", key) != 1) {
             throw invalidInvite();
         }
+        db.sql.queryForObject("SELECT set_config('portal.actor_id', ?, true)", String.class, id.toString());
+        db.sql.queryForObject("SELECT set_config('portal.actor_name', ?, true)", String.class, member.path("name").asText());
+        db.sql.queryForObject("SELECT set_config('portal.actor_email', ?, true)", String.class, member.path("email").asText());
         db.sql.update("UPDATE members SET password_hash = ? WHERE id = ?", encoder.encode(password), id);
     }
 
@@ -168,7 +187,7 @@ class SessionService implements ApplicationRunner {
         return ApiError.invalid("Convite inválido ou expirado. Peça um novo convite.");
     }
 
-    private String readSession(HttpServletRequest request) {
+    String readSession(HttpServletRequest request) {
         Cookie[] cookies = request.getCookies();
         if (cookies == null) return null;
         return Arrays.stream(cookies).filter(cookie -> cookieName.equals(cookie.getName()))

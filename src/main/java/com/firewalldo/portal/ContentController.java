@@ -22,12 +22,13 @@ class ContentController {
     private static final String NEWS = """
         SELECT jsonb_build_object('id', n.id, 'title', n.title, 'summary', n.summary, 'body', n.body,
           'category', n.category, 'source', s.name, 'url', n.url, 'publishedAt', n.published_at,
-          'readMinutes', n.read_minutes, 'featured', n.featured, 'cover', n.cover, 'isDemo', false)
+          'readMinutes', n.read_minutes, 'featured', n.featured, 'cover', n.cover, 'isDemo', false, 'publicationStatus', n.publication_status, 'importedAt', n.imported_at, 'references', n.references_json, 'imageUrl', CASE WHEN n.image_content IS NOT NULL THEN '/api/news/'||n.id||'/image' ELSE NULL END, 'imageCredit', n.image_credit, 'imageSourceUrl', n.image_source_url, 'imageIllustrative', n.image_illustrative)
         FROM news n JOIN radar_sources s ON s.id = n.source_id AND s.active
         """;
     private final Store db;
+    private final RadarImages images;
 
-    ContentController(Store db) { this.db = db; }
+    ContentController(Store db, RadarImages images) { this.db = db; this.images=images; }
 
     @GetMapping("/ideas")
     List<JsonNode> ideas(@RequestAttribute Actor actor) {
@@ -68,8 +69,9 @@ class ContentController {
     }
 
     @GetMapping("/news")
-    List<JsonNode> news() {
-        return db.list(NEWS + " ORDER BY n.featured DESC, n.published_at DESC, n.id");
+    List<JsonNode> news(@RequestAttribute Actor actor, @RequestParam(defaultValue="false") boolean drafts) {
+        if(drafts)actor.requireAdmin();
+        return db.list(NEWS + " WHERE n.publication_status=? ORDER BY n.featured DESC, n.published_at DESC, n.id", drafts?"draft":"published");
     }
 
     @PostMapping("/news")
@@ -96,6 +98,10 @@ class ContentController {
             form.choice("category", "ciberseguranca", "redes", "informatica", "programacao", "ia", "privacidade"),
             form.url("url", false), form.date("publishedAt"), form.number("readMinutes", 1, 120),
             form.bool("featured"), form.choice("cover", "lock", "router", "chip", "ai", "code", "eye", "wifi", "bug"));
+        if(form.has("imageUrl") && !body.path("imageUrl").asText().isBlank()) {
+            var picture=images.download(form.url("imageUrl",false),form.has("imageCredit")?form.text("imageCredit",0,500):"Imagem vinculada pelo administrador",form.url("url",false),false);
+            db.sql.update("UPDATE news SET image_content=?,image_type=?,image_credit=?,image_source_url=? WHERE id=?",picture.bytes(),picture.type(),picture.credit(),picture.sourceUrl(),id);
+        }
         return db.first(NEWS + " WHERE n.id = ?", id);
     }
 
@@ -103,7 +109,7 @@ class ContentController {
     List<UUID> saved(@RequestAttribute Actor actor) {
         return db.sql.queryForList("""
             SELECT b.news_id FROM saved_news b JOIN news n ON n.id = b.news_id
-            JOIN radar_sources s ON s.id = n.source_id AND s.active WHERE b.member_id = ? ORDER BY b.news_id
+            JOIN radar_sources s ON s.id = n.source_id AND s.active WHERE b.member_id = ? AND n.publication_status='published' ORDER BY b.news_id
             """, UUID.class, actor.id());
     }
 
@@ -111,7 +117,7 @@ class ContentController {
     @Transactional
     List<UUID> toggleSaved(@RequestAttribute Actor actor, @PathVariable String id) {
         UUID newsId = Input.id(id);
-        db.require("Notícia não encontrada.", NEWS + " WHERE n.id = ? FOR UPDATE OF n", newsId);
+        db.require("Notícia não encontrada.", NEWS + " WHERE n.id = ? AND n.publication_status='published' FOR UPDATE OF n", newsId);
         if (db.sql.update("DELETE FROM saved_news WHERE news_id = ? AND member_id = ?", newsId, actor.id()) == 0) {
             db.sql.update("INSERT INTO saved_news VALUES (?, ?)", newsId, actor.id());
         }
@@ -133,6 +139,25 @@ class ContentController {
         db.sql.update("UPDATE notifications SET read = true WHERE member_id = ? AND NOT read", actor.id());
     }
 
+
+    @PostMapping("/news/{id}/publish")
+    JsonNode approve(@RequestAttribute Actor actor,@PathVariable String id) {
+        actor.requireAdmin();
+        if(db.sql.update("UPDATE news SET publication_status='published' WHERE id=? AND EXISTS(SELECT 1 FROM radar_sources WHERE id=news.source_id AND active)",Input.id(id))==0)throw ApiError.missing("Notícia ou fonte ativa não encontrada.");
+        return db.first(NEWS+" WHERE n.id=?",Input.id(id));
+    }
+    @DeleteMapping("/news/{id}") @ResponseStatus(HttpStatus.NO_CONTENT)
+    void deleteNews(@RequestAttribute Actor actor,@PathVariable String id) {
+        actor.requireAdmin();
+        if(db.sql.update("DELETE FROM news WHERE id=?",Input.id(id))==0)throw ApiError.missing("Notícia não encontrada.");
+    }
+    @GetMapping("/news/{id}/image")
+    org.springframework.http.ResponseEntity<byte[]> newsImage(@RequestAttribute Actor actor,@PathVariable String id) {
+        var rows=db.sql.query("SELECT n.image_content,n.image_type FROM news n JOIN radar_sources s ON s.id=n.source_id AND s.active WHERE n.id=? AND n.image_content IS NOT NULL AND (n.publication_status='published' OR ?)",
+          (r,i)->org.springframework.http.ResponseEntity.ok().header("Content-Type",r.getString(2)).header("X-Content-Type-Options","nosniff").header("Content-Security-Policy","default-src 'none'").body(r.getBytes(1)),Input.id(id),actor.admin());
+        if(rows.isEmpty())throw ApiError.missing("Imagem não encontrada.");return rows.get(0);
+    }
+
     @GetMapping("/settings/radar-sources")
     List<JsonNode> sources() {
         return db.list("SELECT to_jsonb(s) - 'position' FROM radar_sources s ORDER BY position, id");
@@ -145,10 +170,11 @@ class ContentController {
         db.lock(470004L);
         var sources = Input.list(body, 100, Input::new);
         Input.unique(sources.stream().map(source -> source.key("id")).toList());
-        db.sql.update("DELETE FROM radar_sources");
+        db.sql.update("DELETE FROM radar_sources WHERE NOT (id = ANY(?::text[]))", Store.array(sources.stream().map(source -> source.key("id")).toList()));
         int position = 0;
         for (var source : sources) {
-            db.sql.update("INSERT INTO radar_sources VALUES (?, ?, ?, ?, ?, ?, ?)", source.key("id"), source.text("name", 1, 100),
+            PublicRadarNetwork.publicUrl(source.url("url",false));
+            db.sql.update("INSERT INTO radar_sources VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET name=excluded.name, description=excluded.description, url=excluded.url, short=excluded.short, active=excluded.active, position=excluded.position", source.key("id"), source.text("name", 1, 100),
                 source.text("description", 0, 1000), source.url("url", false), source.text("short", 1, 8),
                 source.bool("active"), position++);
         }
@@ -167,18 +193,45 @@ class ContentController {
         db.lock(470005L);
         var shortcuts = Input.list(body, 100, Input::new);
         Input.unique(shortcuts.stream().map(shortcut -> shortcut.key("id")).toList());
-        db.sql.update("DELETE FROM shortcuts");
+        db.sql.update("DELETE FROM shortcuts WHERE NOT (id = ANY(?::text[]))", Store.array(shortcuts.stream().map(shortcut -> shortcut.key("id")).toList()));
         int position = 0;
         for (var shortcut : shortcuts) {
-            db.sql.update("INSERT INTO shortcuts VALUES (?, ?, ?, ?, ?)", shortcut.key("id"), shortcut.text("label", 1, 100),
+            db.sql.update("INSERT INTO shortcuts VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET label=excluded.label, url=excluded.url, icon=excluded.icon, position=excluded.position", shortcut.key("id"), shortcut.text("label", 1, 100),
                 shortcut.url("url", true), shortcut.choice("icon", "drive", "youtube", "instagram", "tiktok", "landing", "mindmap", "link"),
                 position++);
         }
         return shortcuts();
     }
 
-    @GetMapping({"/library/folders", "/library/files"})
-    List<JsonNode> library() { return List.of(); }
+    @PatchMapping("/settings/shortcuts/{id}")
+    @Transactional
+    JsonNode saveShortcut(@RequestAttribute Actor actor, @PathVariable String id, @RequestBody JsonNode body) {
+        actor.requireAdmin();
+        db.lock(470005L);
+        var input = new Input(body);
+        input.only("url");
+        if (db.sql.update("UPDATE shortcuts SET url = ? WHERE id = ?", input.url("url", true), id) == 0) throw ApiError.missing("Atalho não encontrado.");
+        return db.first("SELECT to_jsonb(s) - 'position' FROM shortcuts s WHERE id = ?", id);
+    }
+
+    @GetMapping("/me/preferences")
+    JsonNode preferences(@RequestAttribute Actor actor) {
+        var value = db.first("SELECT preferences FROM member_preferences WHERE member_id = ?", actor.id());
+        return value == null ? db.decode("{\"theme\":\"dark\",\"reducedMotion\":false,\"notifications\":{\"taskAssigned\":true,\"taskDue\":true,\"projectUpdates\":true,\"newsDigest\":false,\"email\":false}}") : value;
+    }
+
+    @PutMapping("/me/preferences")
+    @Transactional
+    JsonNode savePreferences(@RequestAttribute Actor actor, @RequestBody JsonNode body) {
+        var input = new Input(body); input.only("theme", "reducedMotion", "notifications");
+        input.choice("theme", "dark", "light", "system"); input.bool("reducedMotion");
+        var alerts = new Input(body.path("notifications"));
+        alerts.only("taskAssigned", "taskDue", "projectUpdates", "newsDigest", "email");
+        for (String key : List.of("taskAssigned", "taskDue", "projectUpdates", "newsDigest", "email")) alerts.bool(key);
+        if (alerts.bool("email")) throw ApiError.conflict("O envio por e-mail ainda não está configurado. As notificações estão disponíveis no portal.");
+        db.sql.update("INSERT INTO member_preferences VALUES (?,?::jsonb) ON CONFLICT(member_id) DO UPDATE SET preferences=excluded.preferences", actor.id(), body.toString());
+        return preferences(actor);
+    }
 
     @GetMapping("/health")
     java.util.Map<String, String> health() {
