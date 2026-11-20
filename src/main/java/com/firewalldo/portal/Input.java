@@ -108,6 +108,20 @@ record Input(JsonNode value) {
         throw fieldError(field);
     }
 
+    /** Logo enviada como data URL (png, jpeg, webp ou gif) com até 256 KB. Vazio remove a imagem. */
+    String image(String field) {
+        String image = text(field, 0, 400_000);
+        if (image.isEmpty()) return image;
+        var match = java.util.regex.Pattern.compile("^data:image/(png|jpeg|webp|gif);base64,([A-Za-z0-9+/]+={0,2})$").matcher(image);
+        if (!match.matches()) throw ApiError.invalid("Envie uma imagem PNG, JPG, WEBP ou GIF.");
+        try {
+            if (java.util.Base64.getDecoder().decode(match.group(2)).length > 256 * 1024) throw ApiError.invalid("A imagem deve ter no máximo 256 KB.");
+        } catch (IllegalArgumentException error) {
+            throw fieldError(field);
+        }
+        return image;
+    }
+
     List<UUID> ids(String field) {
         return unique(list(value.path(field), 100, node -> {
             if (!node.isTextual()) throw fieldError(field);

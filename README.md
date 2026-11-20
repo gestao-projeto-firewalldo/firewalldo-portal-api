@@ -59,7 +59,10 @@ manual no Radar. RSS e sincronização com Google Drive não estão configurados
 A V3 adiciona `member_preferences`, `library_folders`, `library_files` e deduplicação de notificações. V1 e V2 não foram modificadas.
 
 - `GET/PUT /api/me/preferences`: preferências validadas e isoladas por conta, com auditoria.
-- `PATCH /api/settings/shortcuts/{id}`: salva um atalho sem depender do formulário inteiro de configurações.
+- `PATCH /api/settings/shortcuts/{id}`: salva nome, link e/ou logo (`label`, `url`, `image`) de um atalho; campos ausentes ficam como estão.
+- `POST /api/settings/shortcuts`: cria um atalho no fim da lista (nome vazio vira "Novo atalho").
+- `DELETE /api/settings/shortcuts/{id}`: remove o atalho.
+- A logo (`image`) é um data URL PNG/JPEG/WEBP/GIF de até 256 KB; `""` remove. Coluna criada pela migração `V7__shortcut_images.sql`.
 - `PATCH /api/projects/{id}`: dados, status, responsáveis e marcos do projeto.
 - `GET /api/library/folders` e `GET/POST /api/library/files`: arquivos reais da equipe. Upload JSON com `name`, `folderId`, `mediaType` e `content` em base64; limite de 5 MiB por arquivo.
 - `GET /api/library/files/{id}/content?download=true`: download autenticado; tipos não permitidos para prévia usam application/octet-stream e attachment. Conteúdo de arquivos não entra na auditoria.

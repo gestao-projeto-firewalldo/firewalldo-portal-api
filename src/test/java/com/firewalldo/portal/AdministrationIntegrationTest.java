@@ -301,4 +301,25 @@ class AdministrationIntegrationTest {
         call(delete("/api/tasks/"+id),root,null,204);
     }
 
+    @Test @Order(16) void shortcutsCanBeCreatedEditedWithLogoAndRemoved() throws Exception {
+        String logo="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        var created=body(call(post("/api/settings/shortcuts"),root,Map.of("label","","url","","image",""),201));
+        String id=created.path("id").asText();
+        assertThat(id).startsWith("sc-");
+        assertThat(created.path("label").asText()).isEqualTo("Novo atalho");
+        assertThat(created.path("icon").asText()).isEqualTo("link");
+        var list=body(call(get("/api/settings/shortcuts"),root,null,200));
+        assertThat(list.get(list.size()-1).path("id").asText()).isEqualTo(id);
+        var edited=body(call(patch("/api/settings/shortcuts/"+id),root,Map.of("label","Canva","url","https://www.canva.com/","image",logo),200));
+        assertThat(edited.path("label").asText()).isEqualTo("Canva");
+        assertThat(edited.path("image").asText()).isEqualTo(logo);
+        call(patch("/api/settings/shortcuts/"+id),root,Map.of("image","data:image/svg+xml;base64,PHN2Zz4="),400);
+        call(patch("/api/settings/shortcuts/"+id),root,Map.of("label",""),400);
+        call(post("/api/settings/shortcuts"),user,Map.of("label","X"),403);
+        call(delete("/api/settings/shortcuts/"+id),user,null,403);
+        call(delete("/api/settings/shortcuts/"+id),root,null,204);
+        call(delete("/api/settings/shortcuts/"+id),root,null,404);
+        assertThat(sql.queryForObject("SELECT count(*) FROM shortcuts WHERE id=?",Integer.class,id)).isZero();
+    }
+
 }

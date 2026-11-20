@@ -186,6 +186,9 @@ class ContentController {
         return db.list("SELECT to_jsonb(s) - 'position' FROM shortcuts s ORDER BY position, id");
     }
 
+    private static final String[] SHORTCUT_ICONS = {"drive", "youtube", "instagram", "tiktok", "landing", "mindmap", "link"};
+    private static final String SHORTCUT = "SELECT to_jsonb(s) - 'position' FROM shortcuts s WHERE id = ?";
+
     @PutMapping("/settings/shortcuts")
     @Transactional
     List<JsonNode> saveShortcuts(@RequestAttribute Actor actor, @RequestBody JsonNode body) {
@@ -196,22 +199,62 @@ class ContentController {
         db.sql.update("DELETE FROM shortcuts WHERE NOT (id = ANY(?::text[]))", Store.array(shortcuts.stream().map(shortcut -> shortcut.key("id")).toList()));
         int position = 0;
         for (var shortcut : shortcuts) {
-            db.sql.update("INSERT INTO shortcuts VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET label=excluded.label, url=excluded.url, icon=excluded.icon, position=excluded.position", shortcut.key("id"), shortcut.text("label", 1, 100),
-                shortcut.url("url", true), shortcut.choice("icon", "drive", "youtube", "instagram", "tiktok", "landing", "mindmap", "link"),
-                position++);
+            String image = shortcut.has("image") ? shortcut.image("image") : null;
+            db.sql.update("INSERT INTO shortcuts (id, label, url, icon, position, image) VALUES (?, ?, ?, ?, ?, COALESCE(?, '')) "
+                    + "ON CONFLICT (id) DO UPDATE SET label=excluded.label, url=excluded.url, icon=excluded.icon, position=excluded.position, "
+                    + "image=COALESCE(?, shortcuts.image)",
+                shortcut.key("id"), shortcut.text("label", 1, 100), shortcut.url("url", true),
+                shortcut.choice("icon", SHORTCUT_ICONS), position++, image, image);
         }
         return shortcuts();
     }
 
+    /** Cria um atalho novo no fim da lista (Visão geral → Acesso rápido → Adicionar). */
+    @PostMapping("/settings/shortcuts")
+    @ResponseStatus(HttpStatus.CREATED)
+    @Transactional
+    JsonNode createShortcut(@RequestAttribute Actor actor, @RequestBody JsonNode body) {
+        actor.requireAdmin();
+        db.lock(470005L);
+        var input = new Input(body);
+        input.only("label", "url", "image", "icon");
+        String label = input.has("label") ? input.text("label", 0, 100) : "";
+        if (label.isEmpty()) label = "Novo atalho";
+        String id = "sc-" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+        int count = db.sql.queryForObject("SELECT count(*) FROM shortcuts", Integer.class);
+        if (count >= 100) throw ApiError.invalid("Limite de 100 atalhos atingido.");
+        db.sql.update("INSERT INTO shortcuts (id, label, url, icon, position, image) VALUES (?, ?, ?, ?, (SELECT COALESCE(max(position) + 1, 0) FROM shortcuts), ?)",
+            id, label, input.has("url") ? input.url("url", true) : "",
+            input.has("icon") ? input.choice("icon", SHORTCUT_ICONS) : "link",
+            input.has("image") ? input.image("image") : "");
+        return db.first(SHORTCUT, id);
+    }
+
+    /** Edita nome, link, logo e/ou ícone de um atalho. Campos ausentes ficam como estão. */
     @PatchMapping("/settings/shortcuts/{id}")
     @Transactional
     JsonNode saveShortcut(@RequestAttribute Actor actor, @PathVariable String id, @RequestBody JsonNode body) {
         actor.requireAdmin();
         db.lock(470005L);
         var input = new Input(body);
-        input.only("url");
-        if (db.sql.update("UPDATE shortcuts SET url = ? WHERE id = ?", input.url("url", true), id) == 0) throw ApiError.missing("Atalho não encontrado.");
-        return db.first("SELECT to_jsonb(s) - 'position' FROM shortcuts s WHERE id = ?", id);
+        input.only("label", "url", "image", "icon");
+        if (db.first(SHORTCUT, id) == null) throw ApiError.missing("Atalho não encontrado.");
+        String label = input.has("label") ? input.text("label", 1, 100) : null;
+        String url = input.has("url") ? input.url("url", true) : null;
+        String image = input.has("image") ? input.image("image") : null;
+        String icon = input.has("icon") ? input.choice("icon", SHORTCUT_ICONS) : null;
+        db.sql.update("UPDATE shortcuts SET label = COALESCE(?, label), url = COALESCE(?, url), image = COALESCE(?, image), icon = COALESCE(?, icon) WHERE id = ?",
+            label, url, image, icon, id);
+        return db.first(SHORTCUT, id);
+    }
+
+    @DeleteMapping("/settings/shortcuts/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @Transactional
+    void deleteShortcut(@RequestAttribute Actor actor, @PathVariable String id) {
+        actor.requireAdmin();
+        db.lock(470005L);
+        if (db.sql.update("DELETE FROM shortcuts WHERE id = ?", id) == 0) throw ApiError.missing("Atalho não encontrado.");
     }
 
     @GetMapping("/me/preferences")
