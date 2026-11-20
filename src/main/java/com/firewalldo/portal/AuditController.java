@@ -21,7 +21,7 @@ class AuditController {
         @RequestParam(defaultValue="1") int page) {
         actor.requireAdmin();
         if (q.length() > 200 || page < 1 || page > 100000) throw ApiError.invalid("Filtro inválido.");
-        if (!List.of("", "criacao","edicao","exclusao","login","logout","ativacao","acesso").contains(action)
+        if (!List.of("", "criacao","edicao","exclusao","conclusao","finalizacao","login","logout","ativacao","acesso").contains(action)
             || !List.of("","sucesso","falha","bloqueado").contains(outcome)) throw ApiError.invalid("Filtro inválido.");
         if (!entity.isEmpty() && !List.of("members","projects","tasks","ideas","idea_votes","news","saved_news","radar_sources","shortcuts","notifications","invitations","member_preferences","library_files","library_folders","autenticacao","radar_settings","radar_runs","push_subscriptions","push_deliveries","task_schedules","task_schedule_runs","member_photos","finance_investments","finance_payments").contains(entity)) throw ApiError.invalid("Módulo inválido.");
         if (from != null && to != null && from.isAfter(to)) throw ApiError.invalid("A data inicial deve vir antes da final.");

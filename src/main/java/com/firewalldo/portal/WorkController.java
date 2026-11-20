@@ -28,7 +28,8 @@ class WorkController {
         SELECT jsonb_build_object('id', t.id, 'title', t.title, 'description', t.description, 'projectId', t.project_id,
           'category', t.category, 'status', t.status, 'priority', t.priority, 'assigneeIds', t.assignee_ids, 'open', t.open,
           'maxAssignees', t.max_assignees, 'eligibleAssigneeIds', t.eligible_assignee_ids, 'dueDate', t.due_date, 'checklist', t.checklist, 'createdBy', t.created_by,
-          'createdAt', t.created_at, 'updatedAt', t.updated_at, 'order', t.position, 'ticketNumber',t.ticket_number,'scheduleId',t.schedule_id,'scheduledFor',t.scheduled_for,'scheduleIndividual',t.schedule_member_id IS NOT NULL)
+          'createdAt', t.created_at, 'updatedAt', t.updated_at, 'order', t.position, 'ticketNumber',t.ticket_number,'scheduleId',t.schedule_id,'scheduledFor',t.scheduled_for,'scheduleIndividual',t.schedule_member_id IS NOT NULL,
+          'finalizedAt',t.finalized_at,'finalizedBy',t.finalized_by,'finalizedByName',t.finalized_by_name,'finalizedProjectName',t.finalized_project_name)
         FROM tasks t
         """;
     private final Store db;
@@ -141,7 +142,8 @@ class WorkController {
     @GetMapping("/tasks")
     List<JsonNode> tasks(@RequestAttribute Actor actor, @RequestParam(required = false) String projectId,
                          @RequestParam(required = false) String assigneeId,
-                         @RequestParam(required = false) String status) {
+                         @RequestParam(required = false) String status,
+                         @RequestParam(defaultValue="false") boolean includeFinalized) {
         boolean availableBacklog = !actor.admin() && assigneeId == null;
         if(!actor.admin()) {
             if(assigneeId!=null && !Input.id(assigneeId).equals(actor.id()))throw ApiError.forbidden();
@@ -152,10 +154,10 @@ class WorkController {
               AND (?::uuid IS NULL OR ?::uuid = ANY(t.assignee_ids)
                 OR (? AND t.status='backlog' AND t.open AND cardinality(t.assignee_ids)<t.max_assignees
                   AND (cardinality(t.eligible_assignee_ids)=0 OR ?::uuid=ANY(t.eligible_assignee_ids))))
-              AND (?::text IS NULL OR t.status = ?)
+              AND (?::text IS NULL OR t.status = ?) AND (? OR t.finalized_at IS NULL)
             ORDER BY t.position, t.id
             """, projectId == null ? null : Input.id(projectId), projectId, assigneeId == null ? null : Input.id(assigneeId),
-            assigneeId, availableBacklog, actor.id(), status, status);
+            assigneeId, availableBacklog, actor.id(), status, status, includeFinalized);
     }
 
     @PostMapping("/tasks")
@@ -192,6 +194,7 @@ class WorkController {
         UUID taskId = Input.id(id);
         db.lock(TASK_LOCK);
         var current = (ObjectNode) task(taskId);
+        requireNotFinalized(current);
         checkAssignee(actor, current);
         var patch = new Input(body);
         String oldStatus = current.path("status").asText();
@@ -236,6 +239,7 @@ class WorkController {
         UUID taskId = Input.id(id);
         db.lock(TASK_LOCK);
         var current = task(taskId);
+        requireNotFinalized(current);
         if (!actor.general() && !new Input(current).ids("assigneeIds").contains(actor.id())) throw ApiError.forbidden();
         var form = new Input(body);
         form.only("status", "beforeId");
@@ -254,6 +258,7 @@ class WorkController {
         UUID taskId = Input.id(id);
         db.lock(TASK_LOCK);
         var current = new Input(task(taskId));
+        requireNotFinalized(current.value());
         var assignees = current.ids("assigneeIds");
         if (assignees.contains(actor.id())) return current.value();
         var eligible = current.ids("eligibleAssigneeIds");
@@ -280,6 +285,7 @@ class WorkController {
         UUID taskId = Input.id(id);
         db.lock(TASK_LOCK);
         var current = new Input(task(taskId));
+        requireNotFinalized(current.value());
         if(current.value().path("scheduleIndividual").asBoolean())throw ApiError.invalid("A atribuição desta tarefa individual é definida pela Agenda.");
         var assignees = current.ids("assigneeIds");
         if(!actor.admin()&&!assignees.contains(actor.id()))throw ApiError.forbidden();
@@ -296,7 +302,29 @@ class WorkController {
     void delete(@RequestAttribute Actor actor, @PathVariable String id) {
         actor.requireAdmin();
         db.lock(TASK_LOCK);
+        requireNotFinalized(task(Input.id(id)));
         if (db.sql.update("DELETE FROM tasks WHERE id = ?", Input.id(id)) == 0) throw ApiError.missing("Tarefa não encontrada.");
+    }
+
+    @PostMapping("/tasks/{id}/finalize")
+    @Transactional
+    JsonNode finalizeTask(@RequestAttribute Actor actor,@PathVariable String id) {
+        if(!actor.general())throw ApiError.forbidden();
+        db.lock(TASK_LOCK);
+        UUID taskId=Input.id(id);var current=task(taskId);
+        if(!current.path("finalizedAt").isNull())return current;
+        if(!current.path("status").asText().equals("concluido"))throw ApiError.invalid("Conclua a tarefa antes de finalizar.");
+        db.sql.update("""
+            UPDATE tasks SET finalized_at=clock_timestamp(),finalized_by=?,
+              finalized_by_name=(SELECT name FROM members WHERE id=?),
+              finalized_project_name=(SELECT name FROM projects WHERE id=tasks.project_id),updated_at=?
+            WHERE id=?
+            """,actor.id(),actor.id(),Input.today(),taskId);
+        return task(taskId);
+    }
+
+    private void requireNotFinalized(JsonNode task) {
+        if(!task.path("finalizedAt").isNull())throw new ApiError(409,"FINALIZED","Esta tarefa foi finalizada e está disponível somente para consulta no histórico.");
     }
 
     private JsonNode task(UUID id) { return db.require("Tarefa não encontrada.", TASK + " WHERE t.id = ?", id); }
