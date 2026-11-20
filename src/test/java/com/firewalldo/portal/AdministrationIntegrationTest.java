@@ -129,14 +129,14 @@ class AdministrationIntegrationTest {
         call(get("/api/audit").param("from","2026-11-19").param("to","2026-11-18"),root,null,400);
     }
 
-    @Test @Order(5) void configurationDiffRecordsOnlyChangedSourcesAndAuditIsReadOnly() throws Exception {
-        var sources=body(call(get("/api/settings/radar-sources"),root,null,200));
-        int before=sql.queryForObject("SELECT count(*) FROM audit_logs WHERE entity='radar_sources'",Integer.class);
-        call(put("/api/settings/radar-sources"),root,sources,200);
-        assertThat(sql.queryForObject("SELECT count(*) FROM audit_logs WHERE entity='radar_sources'",Integer.class)).isEqualTo(before);
-        ((com.fasterxml.jackson.databind.node.ObjectNode)sources.get(0)).put("name","Updated source");
-        call(put("/api/settings/radar-sources"),root,sources,200);
-        assertThat(sql.queryForObject("SELECT count(*) FROM audit_logs WHERE entity='radar_sources' AND action='edicao'",Integer.class)).isEqualTo(before+1);
+    @Test @Order(5) void configurationDiffRecordsOnlyChangedShortcutsAndAuditIsReadOnly() throws Exception {
+        var shortcuts=body(call(get("/api/settings/shortcuts"),root,null,200));
+        int before=sql.queryForObject("SELECT count(*) FROM audit_logs WHERE entity='shortcuts'",Integer.class);
+        call(put("/api/settings/shortcuts"),root,shortcuts,200);
+        assertThat(sql.queryForObject("SELECT count(*) FROM audit_logs WHERE entity='shortcuts'",Integer.class)).isEqualTo(before);
+        ((com.fasterxml.jackson.databind.node.ObjectNode)shortcuts.get(0)).put("label","Updated shortcut");
+        call(put("/api/settings/shortcuts"),root,shortcuts,200);
+        assertThat(sql.queryForObject("SELECT count(*) FROM audit_logs WHERE entity='shortcuts' AND action='edicao'",Integer.class)).isEqualTo(before+1);
         assertThatThrownBy(() -> sql.update("DELETE FROM audit_logs")).hasMessageContaining("somente leitura");
         assertThatThrownBy(() -> sql.update("TRUNCATE audit_logs")).hasMessageContaining("somente leitura");
     }

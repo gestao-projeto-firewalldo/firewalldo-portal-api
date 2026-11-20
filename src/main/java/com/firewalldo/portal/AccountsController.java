@@ -105,7 +105,7 @@ class AccountsController {
     JsonNode update(@RequestAttribute Actor actor, @PathVariable String id, @RequestBody JsonNode body, HttpServletRequest request) {
         UUID memberId = Input.id(id);
         var input = new Input(body);
-        input.only("name", "email", "title", "bio", "role", "active", "areas", "senha", "confirmacaoSenha", "senhaAtual");
+        input.only("name", "email", "title", "bio", "role", "active", "areas", "senha", "confirmacaoSenha", "senhaAtual", "financeAccess");
         db.lock(SessionService.ADMIN_LOCK);
         actor = currentActor(actor);
         var old = lockMember(memberId);
@@ -138,12 +138,58 @@ class AccountsController {
             input.has("title") ? input.text("title", 0, 100) : null,
             input.has("bio") ? input.text("bio", 0, 2000) : null, role, active,
             input.has("areas") ? areas(body) : null, hash, memberId);
+        if (input.has("financeAccess")) {
+            boolean finance = input.bool("financeAccess");
+            // Somente administradores concedem acesso ao Financeiro, e nunca a si mesmos.
+            if (finance != old.path("finance_access").asBoolean() && (!actor.admin() || self)) throw ApiError.forbidden();
+            db.sql.update("UPDATE members SET finance_access = ? WHERE id = ?", finance, memberId);
+        }
         if (hash != null) db.sql.update("DELETE FROM invitations WHERE member_id = ?", memberId);
         if (!active || sensitive || !role.equals(old.path("role").asText())) {
             // Keep the caller's current session on a self-edit; invalidate all other sessions.
             String current = self && active ? sessions.readSession(request) : null;
             db.sql.update("DELETE FROM sessions WHERE member_id = ? AND (?::text IS NULL OR token_hash <> ?)", memberId, current, current);
         }
+        return sessions.member(memberId);
+    }
+
+    /** Foto de perfil (V1.9). Guardada no banco; qualquer usuário autenticado pode vê-la. */
+    @GetMapping("/users/{id}/photo")
+    ResponseEntity<byte[]> photo(@PathVariable String id) {
+        var rows = db.sql.query("SELECT content, media_type FROM member_photos WHERE member_id = ?",
+            (row, index) -> ResponseEntity.ok().header(HttpHeaders.CONTENT_TYPE, row.getString(2))
+                .header(HttpHeaders.CACHE_CONTROL, "private, max-age=31536000, immutable")
+                .header("X-Content-Type-Options", "nosniff").header("Content-Security-Policy", "default-src 'none'")
+                .body(row.getBytes(1)), Input.id(id));
+        if (rows.isEmpty()) throw ApiError.missing("Foto não encontrada.");
+        return rows.get(0);
+    }
+
+    @PutMapping("/users/{id}/photo")
+    @Transactional
+    JsonNode savePhoto(@RequestAttribute Actor actor, @PathVariable String id, @RequestBody JsonNode body) {
+        UUID memberId = Input.id(id);
+        db.lock(SessionService.ADMIN_LOCK);
+        actor = currentActor(actor);
+        requireManage(actor, memberId, lockMember(memberId));
+        var input = new Input(body);
+        input.only("image");
+        var image = input.upload("image", 1024 * 1024, "image/png", "image/jpeg", "image/webp");
+        db.sql.update("""
+            INSERT INTO member_photos (member_id, content, media_type, updated_at) VALUES (?, ?, ?, clock_timestamp())
+            ON CONFLICT (member_id) DO UPDATE SET content = excluded.content, media_type = excluded.media_type, updated_at = clock_timestamp()
+            """, memberId, image.bytes(), image.type());
+        return sessions.member(memberId);
+    }
+
+    @DeleteMapping("/users/{id}/photo")
+    @Transactional
+    JsonNode deletePhoto(@RequestAttribute Actor actor, @PathVariable String id) {
+        UUID memberId = Input.id(id);
+        db.lock(SessionService.ADMIN_LOCK);
+        actor = currentActor(actor);
+        requireManage(actor, memberId, lockMember(memberId));
+        db.sql.update("DELETE FROM member_photos WHERE member_id = ?", memberId);
         return sessions.member(memberId);
     }
 

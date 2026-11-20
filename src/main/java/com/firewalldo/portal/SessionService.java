@@ -30,7 +30,10 @@ class SessionService implements ApplicationRunner {
           'initials', upper(left(split_part(m.name, ' ', 1), 1) || left(split_part(m.name, ' ', 2), 1)),
           'role', m.role, 'title', m.title, 'bio', m.bio, 'areas', m.areas, 'active', m.active,
           'color', '#2563eb', 'pendingInvite', m.password_hash IS NULL,
-          'status', CASE WHEN m.active AND m.last_seen > now() - interval '5 minutes' THEN 'online' ELSE 'offline' END)
+          'status', CASE WHEN m.active AND m.last_seen > now() - interval '5 minutes' THEN 'online' ELSE 'offline' END,
+          'financeAccess', m.finance_access,
+          'avatarUrl', (SELECT '/api/users/' || ph.member_id || '/photo?v=' || floor(extract(epoch FROM ph.updated_at))::bigint
+                        FROM member_photos ph WHERE ph.member_id = m.id))
         """;
 
     private static final Duration SESSION_AGE = Duration.ofDays(7);
@@ -88,6 +91,12 @@ class SessionService implements ApplicationRunner {
         boolean general() { return role.equals("superadmin"); }
         boolean admin() { return general() || role.equals("admin"); }
         void requireAdmin() { if (!admin()) throw ApiError.forbidden(); }
+        /** Financeiro: administradores ou usuários autorizados individualmente (members.finance_access). */
+        void requireFinance(Store db) {
+            if (admin()) return;
+            Boolean allowed = db.sql.queryForObject("SELECT finance_access FROM members WHERE id = ? AND active", Boolean.class, id);
+            if (!Boolean.TRUE.equals(allowed)) throw ApiError.forbidden();
+        }
     }
 
     record Login(JsonNode user, ResponseCookie cookie) {}

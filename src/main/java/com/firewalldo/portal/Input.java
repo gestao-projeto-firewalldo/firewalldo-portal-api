@@ -122,6 +122,44 @@ record Input(JsonNode value) {
         return image;
     }
 
+    /** Arquivo enviado como data URL (base64). Confere tipo declarado, assinatura real e tamanho. */
+    record Upload(byte[] bytes, String type) {}
+
+    Upload upload(String field, int maxBytes, String... types) {
+        String data = text(field, 1, maxBytes / 3 * 4 + 200);
+        var match = java.util.regex.Pattern.compile("^data:([a-z]+/[a-z0-9.+-]+);base64,([A-Za-z0-9+/]+={0,2})$").matcher(data);
+        if (!match.matches() || !Set.of(types).contains(match.group(1))) throw ApiError.invalid("Formato de arquivo não permitido.");
+        byte[] bytes;
+        try { bytes = java.util.Base64.getDecoder().decode(match.group(2)); }
+        catch (IllegalArgumentException error) { throw fieldError(field); }
+        if (bytes.length == 0) throw fieldError(field);
+        if (bytes.length > maxBytes) throw ApiError.invalid("O arquivo deve ter no máximo " + (maxBytes / 1024 / 1024 > 0 ? maxBytes / 1024 / 1024 + " MB." : maxBytes / 1024 + " KB."));
+        if (!signature(bytes, match.group(1))) throw ApiError.invalid("O conteúdo do arquivo não corresponde ao formato informado.");
+        return new Upload(bytes, match.group(1));
+    }
+
+    private static boolean signature(byte[] b, String type) {
+        return switch (type) {
+            case "image/png" -> b.length > 8 && (b[0] & 0xff) == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G';
+            case "image/jpeg" -> b.length > 3 && (b[0] & 0xff) == 0xFF && (b[1] & 0xff) == 0xD8 && (b[2] & 0xff) == 0xFF;
+            case "image/webp" -> b.length > 12 && b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F' && b[8] == 'W' && b[9] == 'E' && b[10] == 'B' && b[11] == 'P';
+            case "application/pdf" -> b.length > 4 && b[0] == '%' && b[1] == 'P' && b[2] == 'D' && b[3] == 'F';
+            default -> false;
+        };
+    }
+
+    /** Valor em reais enviado como centavos inteiros. */
+    long cents(String field) {
+        JsonNode node = value.path(field);
+        if (!node.isIntegralNumber() || !node.canConvertToLong() || node.longValue() < 1 || node.longValue() > 100_000_000_000L) throw fieldError(field);
+        return node.longValue();
+    }
+
+    /** Texto opcional: ausente ou null viram "". */
+    String optionalText(String field, int max) {
+        return !value.has(field) || value.path(field).isNull() ? "" : text(field, 0, max);
+    }
+
     List<UUID> ids(String field) {
         return unique(list(value.path(field), 100, node -> {
             if (!node.isTextual()) throw fieldError(field);

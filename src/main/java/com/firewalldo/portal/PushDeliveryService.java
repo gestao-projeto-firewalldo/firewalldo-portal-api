@@ -15,6 +15,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 @Component
 class PushDeliveryService implements ApplicationRunner {
     private final Store db;private final ObjectMapper json;private final PushSender sender;private final TransactionTemplate tx;
+    static String trim(String text,int max) {return text.substring(0,Math.min(text.length(),max));}
     PushDeliveryService(Store db,ObjectMapper json,PushSender sender,PlatformTransactionManager manager){this.db=db;this.json=json;this.sender=sender;this.tx=new TransactionTemplate(manager);}
     @Override public void run(ApplicationArguments args) {
         tx.executeWithoutResult(state->{db.lock(470007L);if(db.first("SELECT to_jsonb(id) FROM push_config WHERE id='webpush'")!=null)return;
@@ -49,7 +50,7 @@ class PushDeliveryService implements ApplicationRunner {
               """,id);
             if(message==null){tx.executeWithoutResult(state->db.sql.update("UPDATE push_deliveries SET status='expired',message='Inscrição removida ou conta inativa.' WHERE id=?",id));continue;}
             String kind=message.path("kind").asText();String url=kind.equals("noticia")?"/radar":kind.equals("projeto")?"/projetos":kind.equals("tarefa")?(message.path("title").asText().equals("Nova tarefa disponível")?"/tarefas":"/tarefas?meu=1"):"/";
-            String payload=json.valueToTree(Map.of("title",RadarImages.trim(message.path("title").asText(),100),"body",RadarImages.trim(message.path("body").asText(),180),"url",url,"tag",message.path("notificationId").asText(),"accountId",message.path("memberId").asText())).toString();
+            String payload=json.valueToTree(Map.of("title",trim(message.path("title").asText(),100),"body",trim(message.path("body").asText(),180),"url",url,"tag",message.path("notificationId").asText(),"accountId",message.path("memberId").asText())).toString();
             int status=sender.send(message.path("subscription"),payload);
             tx.executeWithoutResult(state->{
                 if(status>=200 && status<300)db.sql.update("UPDATE push_deliveries SET status='accepted',last_http_status=?,message='Provedor aceitou o envio. A exibição depende da permissão e conexão do aparelho.' WHERE id=?",status,id);

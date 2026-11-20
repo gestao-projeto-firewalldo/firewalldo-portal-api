@@ -76,6 +76,8 @@ Rode `mvn test` com JDK 17. Os testes usam PostgreSQL embarcado e não dependem 
 
 ## Revisão 1.5 — Radar e categorias reais
 
+> **Descontinuado na V1.9.** A coleta automática pela OpenAI e os endpoints `/api/settings/radar*`, `/api/settings/radar-sources`, `/api/news/saved` e `/api/news/:id/publish` foram removidos. Veja a seção V1.9.
+
 - `OPENAI_API_KEY`: configure somente no serviço **api**, pelo painel de variáveis do Railway. Nunca no frontend, ZIP, repositório ou campo de fonte. Sem chave, a interface informa a pendência e a coleta não é iniciada.
 - `OPENAI_MODEL`: opcional; padrão `gpt-6.2-astra`. O modelo precisa aceitar Responses API com web_search, filtros por domínio e Structured Outputs.
 - `GET/PUT /api/settings/radar`: somente admin/geral. Configuração persistida: enabled, intervalMinutes (15–1440), lookbackHours (1–168), maxItems (1–10), criteria (10–4000 caracteres), autoPublish e fetchImages. O GET inclui nextRunAt, keyConfigured, model e as últimas 10 execuções. A chave nunca é retornada.
@@ -115,3 +117,32 @@ Sem alteração das migrações V1–V5. OpenAiErrors classifica os códigos ret
 ## Revisão 1.7 — Agenda e tickets
 
 Regras persistentes diárias/a cada N dias, semanais e por datas selecionadas. A API libera tarefas individuais por responsável e horário de Brasília, sem antecipar a criação. Contador transacional global identifica cada tarefa manual/automática com ticket próprio, sem renumerar edições ou reaproveitar excluídos. V6 mantém V1–V5 intactas. Usuários recebem somente suas tarefas pela API; administradores podem filtrar todos ou cada responsável. A versão aparece ao lado do sino. Consulte ../REVISAO-1.7.md e ../ATUALIZAR-CMD.md.
+
+## Revisão 1.9 — Radar manual, fotos, notificações e Financeiro (migração V8)
+
+Migração `V8__portal_v19.sql` é aditiva: não apaga dados. Desliga `radar_settings.enabled`, adiciona colunas em `news`, cria `member_photos`, `finance_investments`, `finance_payments` e `members.finance_access`, e atualiza a auditoria para nunca gravar conteúdo binário.
+
+**Radar de notícias (manual)** — gerenciamento: administradores.
+- `GET /api/news`: notícias com posição (`slot`): principal, secundárias e gerais, nessa ordem.
+- `POST /api/news` `{title, summary, body, slot, image?, sourceName?, sourceUrl?, publishedAt?}`: `image` é data URL PNG/JPEG/WEBP (até 2 MB), obrigatória para `principal` e `secundaria`.
+- `PATCH /api/news/{id}`: mesmos campos, todos opcionais; `image: ""` remove (só para gerais).
+- `DELETE /api/news/{id}` e `GET /api/news/{id}/image`.
+- Limites: 1 principal, 3 secundárias, 5 gerais (409 com mensagem clara). Conferidos com trava transacional; um índice único impede duas principais. Notícias antigas da coleta automática continuam no banco, sem posição, e não aparecem.
+
+**Ideias** — `DELETE /api/ideas/{id}` (administradores): exclusão definitiva; votos saem em cascata. Ideias arquivadas antes da V1.9 são preservadas.
+
+**Foto de perfil** — `PUT /api/users/{id}/photo {image}` (data URL PNG/JPEG/WEBP até 1 MB), `DELETE /api/users/{id}/photo`, `GET /api/users/{id}/photo`. Quem pode editar o usuário pode trocar a foto. `avatarUrl` vem em `/api/users` e `/api/auth/me` (null = iniciais).
+
+**Notificações** — `GET /api/notifications` inclui `createdAtIso`; `POST /api/notifications/{id}/read` marca uma como lida. Eventos: tarefa atribuída, tarefa movida de coluna, prazo próximo, novo projeto, status de projeto alterado.
+
+**Financeiro** — acesso: administradores e usuários com `financeAccess` (concedido por administrador em `PATCH /api/users/{id} {financeAccess}`). Todos os endpoints conferem o acesso.
+- `GET /api/finance/summary`: total mensal estimado (recorrentes ativos), pago no mês, pendente, vencido e próximos vencimentos.
+- `GET/POST /api/finance/investments`, `PATCH/DELETE /api/finance/investments/{id}`, `GET /api/finance/investments/{id}/payments` (histórico).
+- `GET /api/finance/payments?kind=pix|boleto`, `POST /api/finance/payments`, `PATCH/DELETE /api/finance/payments/{id}`, `POST /api/finance/payments/{id}/pay {paidAt, receipt?, receiptName?}`.
+- `GET /api/finance/payments/{id}/attachment` e `/receipt` (PDF ou imagem até 4 MB, guardados no banco).
+- Status `vencido` é calculado (pendente com vencimento passado). Nada é marcado como pago automaticamente.
+- Cobranças recorrentes geram uma ocorrência por período até o mês seguinte, a partir do mês de cadastro. O índice único `(investment_id, period)` impede duplicatas em reinícios. Excluir uma ocorrência recorrente a cancela.
+- Validações: CPF/CNPJ com dígitos verificadores, chave Pix por tipo, linha digitável com 47 ou 48 dígitos.
+- Variáveis opcionais: `FINANCE_INITIAL_DELAY_MS` (padrão 90000) e `FINANCE_INTERVAL_MS` (padrão 21600000).
+
+**Variáveis que deixaram de ser usadas:** `OPENAI_API_KEY`, `OPENAI_MODEL`, `RADAR_INITIAL_DELAY_MS`, `RADAR_POLL_MS`. Podem ser removidas do Railway quando quiser; mantê-las não causa problema.

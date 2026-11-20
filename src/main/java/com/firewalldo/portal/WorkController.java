@@ -101,7 +101,7 @@ class WorkController {
           form.choice("icon","code","layout","smartphone","play","globe","palette","shield","server"),color,
           form.choice("status","planejamento","em_andamento","pausado","concluido"),Store.array(owners),form.date("dueDate"),milestones.toString(),projectCategory(form),form.text("brand",0,140),uuid);
         var updated=project(uuid);
-        if (!updated.equals(before)) notifyProject(actor,updated);
+        if (!updated.equals(before)) notifyProject(actor,updated,before);
         return updated;
     }
 
@@ -118,7 +118,7 @@ class WorkController {
                 ((ObjectNode) milestone).put("done", !milestone.path("done").asBoolean());
                 db.sql.update("UPDATE projects SET milestones = ?::jsonb WHERE id = ?", milestones.toString(), projectId);
                 var updated=project(projectId);
-                notifyProject(actor,updated);
+                notifyProject(actor,updated,updated);
                 return updated;
             }
         }
@@ -185,6 +185,7 @@ class WorkController {
             String checklist = patch.has("checklist") ? checklist(body.path("checklist")) : current.path("checklist").toString();
             db.sql.update("UPDATE tasks SET status = ?, position = ?, checklist = ?::jsonb, updated_at = ? WHERE id = ?",
                 status, position, checklist, Input.today(), taskId);
+            notifyTaskStatus(actor.id(), taskId, current.path("title").asText(), oldStatus, status);
         } else {
             patch.only("title", "description", "projectId", "category", "status", "priority", "assigneeIds",
                 "open", "maxAssignees", "dueDate", "checklist");
@@ -200,6 +201,7 @@ class WorkController {
                 """, data.title, data.description, data.project, data.category, data.status, data.priority,
                 Store.array(data.assignees), data.open, data.max, data.due, data.checklist, position, Input.today(), taskId);
             notifyAssignees(actor.id(), data.title, data.assignees.stream().filter(member -> !oldAssignees.contains(member)).toList());
+            notifyTaskStatus(actor.id(), taskId, data.title, oldStatus, data.status);
         }
         return task(taskId);
     }
@@ -220,6 +222,7 @@ class WorkController {
         int index = column.indexOf(beforeId);
         column.add(index < 0 ? column.size() : index, taskId);
         db.sql.update("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?", status, Input.today(), taskId);
+        notifyTaskStatus(actor.id(), taskId, current.path("title").asText(), current.path("status").asText(), status);
         int position = 0;
         for (UUID member : column) db.sql.update("UPDATE tasks SET position = ? WHERE id = ?", ++position, member);
     }
@@ -322,17 +325,37 @@ class WorkController {
         for (UUID member : ids) {
             if (!member.equals(actor)) db.sql.update(
                 "INSERT INTO notifications (id, member_id, kind, title, description) SELECT ?, ?, 'tarefa', 'Nova tarefa atribuída', ? WHERE COALESCE((SELECT (preferences#>>'{notifications,taskAssigned}')::boolean FROM member_preferences WHERE member_id=?),true)",
-                UUID.randomUUID(), member, title, member);
+                UUID.randomUUID(), member, "Você recebeu a tarefa \"" + title + "\".", member);
         }
     }
-    private void notifyProject(Actor actor,JsonNode project) {
+    private static final Map<String,String> PROJECT_STATUS = Map.of("planejamento","Planejamento","em_andamento","Em andamento","pausado","Pausado","concluido","Concluído");
+    private static final Map<String,String> TASK_STATUS_LABEL = Map.of("backlog","Backlog","a_fazer","A fazer","em_andamento","Em andamento","concluido","Concluído");
+    private void notifyProject(Actor actor,JsonNode project) { notifyProject(actor,project,null); }
+    private void notifyProject(Actor actor,JsonNode project,JsonNode before) {
+        String name=project.path("name").asText();
+        String title="Projeto atualizado", description="O projeto \""+name+"\" foi atualizado.";
+        if (before==null) { title="Novo projeto atribuído"; description="Você faz parte do projeto \""+name+"\"."; }
+        else if (!before.path("status").asText().equals(project.path("status").asText())) {
+            title="Status do projeto alterado";
+            description="\""+name+"\": "+PROJECT_STATUS.getOrDefault(before.path("status").asText(),"")+" → "+PROJECT_STATUS.getOrDefault(project.path("status").asText(),"")+".";
+        }
+        final String heading=title, text=description;
         UUID projectId=Input.id(project.path("id").asText());
         var ids=db.sql.queryForList("""
           SELECT DISTINCT m.id FROM members m WHERE m.active AND m.id<>? AND
           (m.id=ANY(?::uuid[]) OR EXISTS(SELECT 1 FROM tasks t WHERE t.project_id=? AND m.id=ANY(t.assignee_ids)))
           AND COALESCE((SELECT (preferences#>>'{notifications,projectUpdates}')::boolean FROM member_preferences WHERE member_id=m.id),true)
           """,UUID.class,actor.id(),Store.array(new Input(project).ids("ownerIds")),projectId);
-        for (UUID id:ids) db.sql.update("INSERT INTO notifications(id,member_id,kind,title,description) VALUES(?,?,'projeto','Projeto atualizado',?)",UUID.randomUUID(),id,project.path("name").asText());
+        for (UUID id:ids) db.sql.update("INSERT INTO notifications(id,member_id,kind,title,description) VALUES(?,?,'projeto',?,?)",UUID.randomUUID(),id,heading,text);
+    }
+    /** Avisa os responsáveis (exceto quem fez a alteração) quando a tarefa muda de coluna. */
+    private void notifyTaskStatus(UUID actor,UUID taskId,String title,String oldStatus,String status) {
+        if (oldStatus.equals(status)) return;
+        db.sql.update("""
+          INSERT INTO notifications(id,member_id,kind,title,description)
+          SELECT gen_random_uuid(),m.id,'tarefa','Tarefa atualizada',? FROM tasks t JOIN members m ON m.id=ANY(t.assignee_ids) AND m.active
+          WHERE t.id=? AND m.id<>? AND COALESCE((SELECT (preferences#>>'{notifications,taskAssigned}')::boolean FROM member_preferences WHERE member_id=m.id),true)
+          ""","\""+title+"\" foi movida para "+TASK_STATUS_LABEL.getOrDefault(status,status)+".",taskId,actor);
     }
 
 }

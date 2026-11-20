@@ -19,16 +19,9 @@ class ContentController {
           SELECT count(*) AS total, bool_or(member_id = ?) AS mine FROM idea_votes WHERE idea_id = i.id
         ) v
         """;
-    private static final String NEWS = """
-        SELECT jsonb_build_object('id', n.id, 'title', n.title, 'summary', n.summary, 'body', n.body,
-          'category', n.category, 'source', s.name, 'url', n.url, 'publishedAt', n.published_at,
-          'readMinutes', n.read_minutes, 'featured', n.featured, 'cover', n.cover, 'isDemo', false, 'publicationStatus', n.publication_status, 'importedAt', n.imported_at, 'references', n.references_json, 'imageUrl', CASE WHEN n.image_content IS NOT NULL THEN '/api/news/'||n.id||'/image' ELSE NULL END, 'imageCredit', n.image_credit, 'imageSourceUrl', n.image_source_url, 'imageIllustrative', n.image_illustrative)
-        FROM news n JOIN radar_sources s ON s.id = n.source_id AND s.active
-        """;
     private final Store db;
-    private final RadarImages images;
 
-    ContentController(Store db, RadarImages images) { this.db = db; this.images=images; }
+    ContentController(Store db) { this.db = db; }
 
     @GetMapping("/ideas")
     List<JsonNode> ideas(@RequestAttribute Actor actor) {
@@ -57,6 +50,15 @@ class ContentController {
         }
     }
 
+    /** Exclusão definitiva (V1.9). Os votos são removidos em cascata pelo banco. */
+    @DeleteMapping("/ideas/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @Transactional
+    void deleteIdea(@RequestAttribute Actor actor, @PathVariable String id) {
+        actor.requireAdmin();
+        if (db.sql.update("DELETE FROM ideas WHERE id = ?", Input.id(id)) == 0) throw ApiError.missing("Ideia não encontrada.");
+    }
+
     @PostMapping("/ideas/{id}/vote")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     @Transactional
@@ -68,69 +70,22 @@ class ContentController {
         }
     }
 
-    @GetMapping("/news")
-    List<JsonNode> news(@RequestAttribute Actor actor, @RequestParam(defaultValue="false") boolean drafts) {
-        if(drafts)actor.requireAdmin();
-        return db.list(NEWS + " WHERE n.publication_status=? ORDER BY n.featured DESC, n.published_at DESC, n.id", drafts?"draft":"published");
-    }
-
-    @PostMapping("/news")
-    @ResponseStatus(HttpStatus.CREATED)
-    @Transactional
-    JsonNode publish(@RequestAttribute Actor actor, @RequestBody JsonNode body) {
-        actor.requireAdmin();
-        var form = new Input(body);
-        UUID id = UUID.randomUUID();
-        String sourceId = form.key("sourceId");
-        db.lock(470004L);
-        db.require("Selecione uma fonte ativa.", "SELECT to_jsonb(id) FROM radar_sources WHERE id = ? AND active", sourceId);
-        List<String> paragraphs = Input.list(body.path("body"), 30, node -> {
-            if (!node.isTextual() || node.textValue().isBlank() || node.textValue().length() > 5000 || node.textValue().indexOf(0) >= 0) {
-                throw ApiError.invalid("Cada parágrafo deve ter de 1 a 5.000 caracteres.");
-            }
-            return node.textValue().strip();
-        });
-        if (paragraphs.isEmpty()) throw ApiError.invalid("Informe o texto da notícia.");
-        db.sql.update("""
-            INSERT INTO news (id, source_id, title, summary, body, category, url, published_at, read_minutes, featured, cover)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, id, sourceId, form.text("title", 3, 250), form.text("summary", 1, 1000), paragraphs.toArray(String[]::new),
-            form.choice("category", "ciberseguranca", "redes", "informatica", "programacao", "ia", "privacidade"),
-            form.url("url", false), form.date("publishedAt"), form.number("readMinutes", 1, 120),
-            form.bool("featured"), form.choice("cover", "lock", "router", "chip", "ai", "code", "eye", "wifi", "bug"));
-        if(form.has("imageUrl") && !body.path("imageUrl").asText().isBlank()) {
-            var picture=images.download(form.url("imageUrl",false),form.has("imageCredit")?form.text("imageCredit",0,500):"Imagem vinculada pelo administrador",form.url("url",false),false);
-            db.sql.update("UPDATE news SET image_content=?,image_type=?,image_credit=?,image_source_url=? WHERE id=?",picture.bytes(),picture.type(),picture.credit(),picture.sourceUrl(),id);
-        }
-        return db.first(NEWS + " WHERE n.id = ?", id);
-    }
-
-    @GetMapping("/news/saved")
-    List<UUID> saved(@RequestAttribute Actor actor) {
-        return db.sql.queryForList("""
-            SELECT b.news_id FROM saved_news b JOIN news n ON n.id = b.news_id
-            JOIN radar_sources s ON s.id = n.source_id AND s.active WHERE b.member_id = ? AND n.publication_status='published' ORDER BY b.news_id
-            """, UUID.class, actor.id());
-    }
-
-    @PostMapping("/news/{id}/save")
-    @Transactional
-    List<UUID> toggleSaved(@RequestAttribute Actor actor, @PathVariable String id) {
-        UUID newsId = Input.id(id);
-        db.require("Notícia não encontrada.", NEWS + " WHERE n.id = ? AND n.publication_status='published' FOR UPDATE OF n", newsId);
-        if (db.sql.update("DELETE FROM saved_news WHERE news_id = ? AND member_id = ?", newsId, actor.id()) == 0) {
-            db.sql.update("INSERT INTO saved_news VALUES (?, ?)", newsId, actor.id());
-        }
-        return saved(actor);
-    }
-
     @GetMapping("/notifications")
     List<JsonNode> notifications(@RequestAttribute Actor actor) {
         return db.list("""
             SELECT jsonb_build_object('id', id, 'kind', kind, 'title', title, 'description', description,
-              'createdAt', to_char(created_at AT TIME ZONE 'America/Sao_Paulo', 'DD/MM/YYYY HH24:MI'), 'read', read)
+              'createdAt', to_char(created_at AT TIME ZONE 'America/Sao_Paulo', 'DD/MM/YYYY HH24:MI'),
+              'createdAtIso', created_at, 'read', read)
             FROM notifications WHERE member_id = ? ORDER BY created_at DESC, id LIMIT 100
             """, actor.id());
+    }
+
+    @PostMapping("/notifications/{id}/read")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    void read(@RequestAttribute Actor actor, @PathVariable String id) {
+        if (db.sql.update("UPDATE notifications SET read = true WHERE id = ? AND member_id = ?", Input.id(id), actor.id()) == 0) {
+            throw ApiError.missing("Notificação não encontrada.");
+        }
     }
 
     @PostMapping("/notifications/read-all")
@@ -139,47 +94,6 @@ class ContentController {
         db.sql.update("UPDATE notifications SET read = true WHERE member_id = ? AND NOT read", actor.id());
     }
 
-
-    @PostMapping("/news/{id}/publish")
-    JsonNode approve(@RequestAttribute Actor actor,@PathVariable String id) {
-        actor.requireAdmin();
-        if(db.sql.update("UPDATE news SET publication_status='published' WHERE id=? AND EXISTS(SELECT 1 FROM radar_sources WHERE id=news.source_id AND active)",Input.id(id))==0)throw ApiError.missing("Notícia ou fonte ativa não encontrada.");
-        return db.first(NEWS+" WHERE n.id=?",Input.id(id));
-    }
-    @DeleteMapping("/news/{id}") @ResponseStatus(HttpStatus.NO_CONTENT)
-    void deleteNews(@RequestAttribute Actor actor,@PathVariable String id) {
-        actor.requireAdmin();
-        if(db.sql.update("DELETE FROM news WHERE id=?",Input.id(id))==0)throw ApiError.missing("Notícia não encontrada.");
-    }
-    @GetMapping("/news/{id}/image")
-    org.springframework.http.ResponseEntity<byte[]> newsImage(@RequestAttribute Actor actor,@PathVariable String id) {
-        var rows=db.sql.query("SELECT n.image_content,n.image_type FROM news n JOIN radar_sources s ON s.id=n.source_id AND s.active WHERE n.id=? AND n.image_content IS NOT NULL AND (n.publication_status='published' OR ?)",
-          (r,i)->org.springframework.http.ResponseEntity.ok().header("Content-Type",r.getString(2)).header("X-Content-Type-Options","nosniff").header("Content-Security-Policy","default-src 'none'").body(r.getBytes(1)),Input.id(id),actor.admin());
-        if(rows.isEmpty())throw ApiError.missing("Imagem não encontrada.");return rows.get(0);
-    }
-
-    @GetMapping("/settings/radar-sources")
-    List<JsonNode> sources() {
-        return db.list("SELECT to_jsonb(s) - 'position' FROM radar_sources s ORDER BY position, id");
-    }
-
-    @PutMapping("/settings/radar-sources")
-    @Transactional
-    List<JsonNode> saveSources(@RequestAttribute Actor actor, @RequestBody JsonNode body) {
-        actor.requireAdmin();
-        db.lock(470004L);
-        var sources = Input.list(body, 100, Input::new);
-        Input.unique(sources.stream().map(source -> source.key("id")).toList());
-        db.sql.update("DELETE FROM radar_sources WHERE NOT (id = ANY(?::text[]))", Store.array(sources.stream().map(source -> source.key("id")).toList()));
-        int position = 0;
-        for (var source : sources) {
-            PublicRadarNetwork.publicUrl(source.url("url",false));
-            db.sql.update("INSERT INTO radar_sources VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET name=excluded.name, description=excluded.description, url=excluded.url, short=excluded.short, active=excluded.active, position=excluded.position", source.key("id"), source.text("name", 1, 100),
-                source.text("description", 0, 1000), source.url("url", false), source.text("short", 1, 8),
-                source.bool("active"), position++);
-        }
-        return sources();
-    }
 
     @GetMapping("/settings/shortcuts")
     List<JsonNode> shortcuts() {

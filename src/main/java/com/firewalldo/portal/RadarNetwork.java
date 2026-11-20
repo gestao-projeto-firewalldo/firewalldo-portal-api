@@ -1,31 +1,13 @@
 package com.firewalldo.portal;
 
 import java.net.*;
-import java.nio.charset.StandardCharsets;
-import java.time.Duration;
-import java.util.*;
-import okhttp3.*;
-import org.springframework.stereotype.Component;
 
-/** Narrow transport boundary: test fixtures never contact paid providers. */
-interface RadarNetwork {
-    record Resource(byte[] bytes, String type, String url) {
-        String text() { return new String(bytes, StandardCharsets.UTF_8); }
-    }
-    Resource get(String url, int limit);
-    String openai(String key, String body);
-}
-
-@Component
-class PublicRadarNetwork implements RadarNetwork {
-    private final OkHttpClient client = new OkHttpClient.Builder()
-        .dns(host -> {
-            var addresses = Arrays.asList(InetAddress.getAllByName(host));
-            if (addresses.isEmpty() || addresses.stream().anyMatch(a -> !isPublic(a))) throw new UnknownHostException("Endereço não público.");
-            return addresses;
-        })
-        .proxy(Proxy.NO_PROXY).followRedirects(false).followSslRedirects(false)
-        .connectTimeout(Duration.ofSeconds(10)).readTimeout(Duration.ofSeconds(120)).callTimeout(Duration.ofSeconds(150)).build();
+/**
+ * Validação de endereços públicos (usada pelo envio de notificações push).
+ * V1.9: a coleta automática do Radar pela OpenAI foi removida; restaram só estas regras.
+ */
+final class PublicRadarNetwork {
+    private PublicRadarNetwork() {}
 
     static boolean isPublic(InetAddress address) {
         if (address.isAnyLocalAddress() || address.isLoopbackAddress() || address.isLinkLocalAddress() || address.isSiteLocalAddress() || address.isMulticastAddress()) return false;
@@ -49,36 +31,5 @@ class PublicRadarNetwork implements RadarNetwork {
             } else if (!host.contains(".")) throw new IllegalArgumentException();
             return uri.toASCIIString();
         } catch(Exception e) { throw ApiError.invalid("Use um endereço público HTTP/HTTPS válido, sem credenciais ou portas especiais."); }
-    }
-    @Override public Resource get(String input,int limit) {
-        String url=publicUrl(input);
-        var fast=client.newBuilder().callTimeout(Duration.ofSeconds(20)).readTimeout(Duration.ofSeconds(15)).build();
-        for(int redirect=0;redirect<4;redirect++) {
-            try (Response response=fast.newCall(new Request.Builder().url(url).header("User-Agent","Firewalldo-Radar/1.6").header("Accept","text/html,application/json,image/*;q=0.8").get().build()).execute()) {
-                if (response.isRedirect()) { String target=response.header("Location"); if(target==null)break;url=publicUrl(URI.create(url).resolve(target).toString());continue; }
-                if (!response.isSuccessful() || response.body()==null) throw ApiError.invalid("A fonte não respondeu com conteúdo disponível.");
-                if (response.body().contentLength()>limit) throw ApiError.invalid("O conteúdo da fonte excede o limite permitido.");
-                byte[] bytes=response.body().byteStream().readNBytes(limit+1);
-                if(bytes.length>limit)throw ApiError.invalid("O conteúdo da fonte excede o limite permitido.");
-                return new Resource(bytes,response.header("Content-Type","application/octet-stream"),url);
-            } catch (ApiError e) { throw e; }
-            catch(Exception e) { throw ApiError.invalid("Não foi possível acessar a fonte pública (conexão, tempo limite ou endereço bloqueado)."); }
-        }
-        throw ApiError.invalid("A fonte redirecionou muitas vezes.");
-    }
-    @Override public String openai(String key,String body) {
-        var request=new Request.Builder().url("https://api.openai.com/v1/responses")
-            .header("Authorization","Bearer "+key).post(RequestBody.create(body,MediaType.get("application/json"))).build();
-        try(Response response=client.newCall(request).execute()) {
-            if(!response.isSuccessful()) {
-                String details="";
-                if(response.body()!=null)details=new String(response.body().byteStream().readNBytes(64_000),StandardCharsets.UTF_8);
-                throw OpenAiErrors.failure(response.code(),details,response.header("Retry-After"));
-            }
-            if(response.body()==null || response.body().contentLength()>2_000_000) throw ApiError.invalid("Resposta da OpenAI inválida.");
-            byte[] bytes=response.body().byteStream().readNBytes(2_000_001);
-            if(bytes.length>2_000_000)throw ApiError.invalid("Resposta da OpenAI acima do limite.");
-            return new String(bytes,StandardCharsets.UTF_8);
-        } catch(ApiError e) {throw e;} catch(Exception e) {throw ApiError.invalid("A pesquisa na OpenAI excedeu o tempo de espera ou falhou na conexão.");}
     }
 }
