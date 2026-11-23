@@ -53,6 +53,7 @@ class AgendaIntegrationTest {
         String id=create(form("scheduled"));assertThat(agenda.releaseDue(at(start).minusSeconds(1))).isZero();assertThat(tasks(id,king)).isEmpty();
         assertThat(agenda.releaseDue(at(start))).isEqualTo(2);var all=tasks(id,king);assertThat(all).hasSize(2);assertThat(all.get(0).path("id")).isNotEqualTo(all.get(1).path("id"));
         var mine=tasks(id,user).get(0);var theirs=tasks(id,other).get(0);assertThat(mine.path("assigneeIds").size()).isEqualTo(1);assertThat(mine.path("dueDate").asText()).isEqualTo(start.plusDays(2).toString());
+        call(patch("/api/tasks/"+mine.path("id").asText()),user,Map.of("status","em_andamento"),200);
         call(patch("/api/tasks/"+mine.path("id").asText()),user,Map.of("status","concluido","checklist",List.of(Map.of("id","check-1","text","Verificar alertas","done",true))),200);
         assertThat(tasks(id,other).get(0).path("status").asText()).isEqualTo("a_fazer");assertThat(tasks(id,other).get(0).path("checklist").get(0).path("done").asBoolean()).isFalse();
         call(patch("/api/tasks/"+theirs.path("id").asText()),user,Map.of("status","concluido"),403);
@@ -120,6 +121,7 @@ class AgendaIntegrationTest {
         var manual=json.createObjectNode().put("title","Primeiro ticket manual").put("description","").putNull("projectId").put("category","gestao").put("status","a_fazer").put("priority","media").put("open",false).put("maxAssignees",1).putNull("dueDate");manual.putArray("assigneeIds").add(userId);manual.putArray("checklist");
         var first=call(post("/api/tasks"),admin,manual,201);assertThat(first.path("ticketNumber").asLong()).isEqualTo(before+1);
         call(patch("/api/tasks/"+first.path("id").asText()),admin,Map.of("title","Ticket editado"),200);
+        call(patch("/api/tasks/"+first.path("id").asText()),user,Map.of("status","em_andamento"),200);
         var unchanged=call(patch("/api/tasks/"+first.path("id").asText()),user,Map.of("status","concluido"),200);assertThat(unchanged.path("ticketNumber").asLong()).isEqualTo(before+1);
         call(patch("/api/tasks/"+first.path("id").asText()),admin,Map.of("ticketNumber",9000),400);
         manual.put("title","x");call(post("/api/tasks"),admin,manual,400);assertThat(sql.queryForObject("SELECT last_number FROM task_ticket_counter",Long.class)).isEqualTo(before+1);

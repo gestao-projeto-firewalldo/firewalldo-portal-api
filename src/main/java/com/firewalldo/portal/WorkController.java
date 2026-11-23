@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.firewalldo.portal.SessionService.Actor;
 import java.time.LocalDate;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -107,6 +106,20 @@ class WorkController {
 
     private String projectCategory(Input form) { return !form.has("category") || form.value().path("category").isNull() ? null : form.choice("category", Input.AREAS); }
 
+    @DeleteMapping("/projects/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @Transactional
+    void deleteProject(@RequestAttribute Actor actor, @PathVariable String id) {
+        actor.requireAdmin();
+        db.lock(TASK_LOCK);
+        UUID projectId = Input.id(id);
+        db.require("Projeto não encontrado.", "SELECT to_jsonb(id) FROM projects WHERE id=? FOR UPDATE", projectId);
+        // Keep tickets, occurrences and audit history; future releases also become unlinked.
+        db.sql.update("UPDATE tasks SET project_id=NULL,updated_at=? WHERE project_id=?", Input.today(), projectId);
+        db.sql.update("UPDATE task_schedules SET config=jsonb_set(config,'{projectId}','null'::jsonb),updated_at=clock_timestamp() WHERE config->>'projectId'=?", projectId.toString());
+        db.sql.update("DELETE FROM projects WHERE id=?", projectId);
+    }
+
     @PatchMapping("/projects/{id}/milestones/{milestoneId}")
     @Transactional
     JsonNode toggleMilestone(@RequestAttribute Actor actor, @PathVariable String id, @PathVariable String milestoneId) {
@@ -129,17 +142,19 @@ class WorkController {
     List<JsonNode> tasks(@RequestAttribute Actor actor, @RequestParam(required = false) String projectId,
                          @RequestParam(required = false) String assigneeId,
                          @RequestParam(required = false) String status) {
+        boolean availableBacklog = !actor.admin() && assigneeId == null;
         if(!actor.admin()) {
             if(assigneeId!=null && !Input.id(assigneeId).equals(actor.id()))throw ApiError.forbidden();
             assigneeId=actor.id().toString();
         }
         return db.list(TASK + """
             WHERE (?::uuid IS NULL OR t.project_id = ?::uuid)
-              AND (?::uuid IS NULL OR ?::uuid = ANY(t.assignee_ids))
+              AND (?::uuid IS NULL OR ?::uuid = ANY(t.assignee_ids)
+                OR (? AND t.status='backlog' AND t.open AND cardinality(t.assignee_ids)<t.max_assignees))
               AND (?::text IS NULL OR t.status = ?)
             ORDER BY t.position, t.id
             """, projectId == null ? null : Input.id(projectId), projectId, assigneeId == null ? null : Input.id(assigneeId),
-            assigneeId, status, status);
+            assigneeId, availableBacklog, status, status);
     }
 
     @PostMapping("/tasks")
@@ -151,6 +166,8 @@ class WorkController {
         var form = new Input(body);
         UUID id = UUID.randomUUID();
         var data = taskData(form);
+        if (!List.of("backlog", "a_fazer").contains(data.status))
+            throw ApiError.invalid("Crie a tarefa no Backlog ou em A fazer e use os botões para avançar.");
         var date = Input.today();
         db.sql.update("""
             INSERT INTO tasks (id, title, description, project_id, category, status, priority, assignee_ids, open,
@@ -177,6 +194,7 @@ class WorkController {
         var patch = new Input(body);
         String oldStatus = current.path("status").asText();
         String status = patch.has("status") ? patch.choice("status", Input.TASK_STATUS) : oldStatus;
+        validateTransition(actor, current, status);
         int position = oldStatus.equals(status) ? current.path("order").asInt() : endOf(status);
         if (!actor.admin()) {
             if (hasRestrictedTaskFields(patch.value())) {
@@ -213,18 +231,16 @@ class WorkController {
         UUID taskId = Input.id(id);
         db.lock(TASK_LOCK);
         var current = task(taskId);
-        checkAssignee(actor, current);
+        if (!actor.general() && !new Input(current).ids("assigneeIds").contains(actor.id())) throw ApiError.forbidden();
         var form = new Input(body);
+        form.only("status", "beforeId");
         String status = form.choice("status", Input.TASK_STATUS);
-        UUID beforeId = form.optionalId("beforeId");
-        var column = new ArrayList<>(db.sql.queryForList(
-            "SELECT id FROM tasks WHERE status = ? AND id <> ? ORDER BY position, id", UUID.class, status, taskId));
-        int index = column.indexOf(beforeId);
-        column.add(index < 0 ? column.size() : index, taskId);
-        db.sql.update("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?", status, Input.today(), taskId);
+        validateTransition(actor, current, status);
+        UUID beforeId = form.has("beforeId") ? form.optionalId("beforeId") : null;
+        if (beforeId != null) throw ApiError.invalid("Use os botões Avançar e Voltar para mover a tarefa.");
+        if (current.path("status").asText().equals(status)) return;
+        db.sql.update("UPDATE tasks SET status = ?, position = ?, updated_at = ? WHERE id = ?", status, endOf(status), Input.today(), taskId);
         notifyTaskStatus(actor.id(), taskId, current.path("title").asText(), current.path("status").asText(), status);
-        int position = 0;
-        for (UUID member : column) db.sql.update("UPDATE tasks SET position = ? WHERE id = ?", ++position, member);
     }
 
     @PostMapping("/tasks/{id}/accept")
@@ -291,6 +307,22 @@ class WorkController {
 
     private void checkAssignee(Actor actor, JsonNode task) {
         if (!actor.admin() && !new Input(task).ids("assigneeIds").contains(actor.id())) throw ApiError.forbidden();
+    }
+
+    private void validateTransition(Actor actor, JsonNode task, String next) {
+        String previous = task.path("status").asText();
+        if (!actor.general() && !new Input(task).ids("assigneeIds").contains(actor.id())) {
+            // Administrators may edit metadata, but cannot move another person's task.
+            if (!previous.equals(next)) throw ApiError.forbidden();
+        }
+        if (previous.equals(next)) return;
+        boolean allowed = switch (previous) {
+            case "a_fazer" -> next.equals("em_andamento");
+            case "em_andamento" -> next.equals("a_fazer") || next.equals("concluido");
+            case "concluido" -> next.equals("em_andamento");
+            default -> false;
+        };
+        if (!allowed) throw ApiError.invalid("Use a próxima etapa ou a anterior. No Backlog, use Aceitar tarefa.");
     }
 
     private record TaskData(String title, String description, UUID project, String category, String status,

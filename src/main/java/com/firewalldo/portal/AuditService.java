@@ -30,6 +30,10 @@ class AuditService {
         config("actor_name", member == null ? "Sistema" : member.path("name").asText());
         config("actor_email", member == null ? "" : member.path("email").asText());
         config("ip", ip(request));
+        config("actor_role", actor == null ? "" : actor.role());
+        config("method", request.getMethod());
+        Object route = request.getAttribute(org.springframework.web.servlet.HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE);
+        config("route", route == null ? "/api" : route.toString());
     }
 
     private void config(String name, String value) {

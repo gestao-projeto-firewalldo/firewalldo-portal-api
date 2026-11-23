@@ -203,7 +203,9 @@ class AdministrationIntegrationTest {
         user=login("user@example.test","new-user-test-password");
         call(patch("/api/settings/shortcuts/sc-drive"),user,Map.of("url","https://example.test"),403);
         call(patch("/api/settings/shortcuts/sc-drive"),root,Map.of("url","javascript:alert(1)"),400);
-        assertThat(body(call(get("/api/audit").param("entity","shortcuts").param("action","edicao").param("q","Google Drive"),root,null,200)).path("total").asInt()).isEqualTo(1);
+        // An earlier test renamed this shortcut; search its stable ID rather than the old label.
+        var audit=body(call(get("/api/audit").param("entity","shortcuts").param("action","edicao").param("q","sc-drive"),root,null,200));
+        assertThat(audit.path("items").get(0).path("details").path("fields")).contains(json.getNodeFactory().textNode("url"));
     }
 
     @Test @Order(10) void preferencesPersistByAccountAndAuditOnlyChanges() throws Exception {
