@@ -27,7 +27,7 @@ class WorkController {
     private static final String TASK = """
         SELECT jsonb_build_object('id', t.id, 'title', t.title, 'description', t.description, 'projectId', t.project_id,
           'category', t.category, 'status', t.status, 'priority', t.priority, 'assigneeIds', t.assignee_ids, 'open', t.open,
-          'maxAssignees', t.max_assignees, 'dueDate', t.due_date, 'checklist', t.checklist, 'createdBy', t.created_by,
+          'maxAssignees', t.max_assignees, 'eligibleAssigneeIds', t.eligible_assignee_ids, 'dueDate', t.due_date, 'checklist', t.checklist, 'createdBy', t.created_by,
           'createdAt', t.created_at, 'updatedAt', t.updated_at, 'order', t.position, 'ticketNumber',t.ticket_number,'scheduleId',t.schedule_id,'scheduledFor',t.scheduled_for)
         FROM tasks t
         """;
@@ -150,11 +150,12 @@ class WorkController {
         return db.list(TASK + """
             WHERE (?::uuid IS NULL OR t.project_id = ?::uuid)
               AND (?::uuid IS NULL OR ?::uuid = ANY(t.assignee_ids)
-                OR (? AND t.status='backlog' AND t.open AND cardinality(t.assignee_ids)<t.max_assignees))
+                OR (? AND t.status='backlog' AND t.open AND cardinality(t.assignee_ids)<t.max_assignees
+                  AND (cardinality(t.eligible_assignee_ids)=0 OR ?::uuid=ANY(t.eligible_assignee_ids))))
               AND (?::text IS NULL OR t.status = ?)
             ORDER BY t.position, t.id
             """, projectId == null ? null : Input.id(projectId), projectId, assigneeId == null ? null : Input.id(assigneeId),
-            assigneeId, availableBacklog, status, status);
+            assigneeId, availableBacklog, actor.id(), status, status);
     }
 
     @PostMapping("/tasks")
@@ -170,17 +171,18 @@ class WorkController {
             throw ApiError.invalid("Crie a tarefa no Backlog ou em A fazer e use os botões para avançar.");
         var date = Input.today();
         db.sql.update("""
-            INSERT INTO tasks (id, title, description, project_id, category, status, priority, assignee_ids, open,
+            INSERT INTO tasks (id, title, description, project_id, category, status, priority, assignee_ids, eligible_assignee_ids, open,
               max_assignees, due_date, checklist, created_by, created_at, updated_at, position)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?::uuid[], ?, ?, ?, ?::jsonb, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?::uuid[], ?::uuid[], ?, ?, ?, ?::jsonb, ?, ?, ?, ?)
             """, id, data.title, data.description, data.project, data.category, data.status, data.priority,
-            Store.array(data.assignees), data.open, data.max, data.due, data.checklist, actor.id(), date, date, endOf(data.status));
+            Store.array(data.assignees), Store.array(data.eligible), data.open, data.max, data.due, data.checklist, actor.id(), date, date, endOf(data.status));
         notifyAssignees(actor.id(), data.title, data.assignees);
         if(data.open) db.sql.update("""
           INSERT INTO notifications(id,member_id,kind,title,description)
           SELECT gen_random_uuid(),m.id,'tarefa','Nova tarefa disponível',? FROM members m WHERE m.active AND m.id<>?
-          AND NOT (m.id=ANY(?::uuid[])) AND COALESCE((SELECT (preferences#>>'{notifications,taskAssigned}')::boolean FROM member_preferences WHERE member_id=m.id),true)
-          """,data.title,actor.id(),Store.array(data.assignees));
+          AND NOT (m.id=ANY(?::uuid[])) AND (cardinality(?::uuid[])=0 OR m.id=ANY(?::uuid[]))
+          AND COALESCE((SELECT (preferences#>>'{notifications,taskAssigned}')::boolean FROM member_preferences WHERE member_id=m.id),true)
+          """,data.title,actor.id(),Store.array(data.assignees),Store.array(data.eligible),Store.array(data.eligible));
         return task(id);
     }
 
@@ -206,18 +208,21 @@ class WorkController {
             notifyTaskStatus(actor.id(), taskId, current.path("title").asText(), oldStatus, status);
         } else {
             patch.only("title", "description", "projectId", "category", "status", "priority", "assigneeIds",
-                "open", "maxAssignees", "dueDate", "checklist");
+                "open", "maxAssignees", "dueDate", "checklist", "eligibleAssigneeIds");
             List<UUID> oldAssignees = new Input(current).ids("assigneeIds");
             current.setAll((ObjectNode) body);
             var data = taskData(new Input(current), oldAssignees);
-            if(!current.path("scheduleId").isNull() && (!data.assignees.equals(oldAssignees) || data.open || data.max!=1))
+            if (oldStatus.equals("backlog") && !data.assignees.equals(oldAssignees))
+                throw ApiError.invalid("No Backlog, selecione quem pode aceitar. Os responsáveis são definidos pelos aceites.");
+            if(!current.path("scheduleId").isNull() && (!data.assignees.equals(oldAssignees) || !data.eligible.isEmpty() || data.open || data.max!=1))
                 throw ApiError.invalid("A tarefa da Agenda é individual. Edite os responsáveis na Agenda para as próximas aberturas.");
             db.sql.update("""
                 UPDATE tasks SET title = ?, description = ?, project_id = ?, category = ?, status = ?, priority = ?,
-                  assignee_ids = ?::uuid[], open = ?, max_assignees = ?, due_date = ?, checklist = ?::jsonb,
+                  assignee_ids = ?::uuid[], eligible_assignee_ids = ?::uuid[], open = ?, max_assignees = ?, due_date = ?, checklist = ?::jsonb,
                   position = ?, updated_at = ? WHERE id = ?
                 """, data.title, data.description, data.project, data.category, data.status, data.priority,
-                Store.array(data.assignees), data.open, data.max, data.due, data.checklist, position, Input.today(), taskId);
+                Store.array(data.assignees), Store.array(data.eligible), data.open, data.max, data.due, data.checklist,
+                oldStatus.equals(data.status) ? position : endOf(data.status), Input.today(), taskId);
             notifyAssignees(actor.id(), data.title, data.assignees.stream().filter(member -> !oldAssignees.contains(member)).toList());
             notifyTaskStatus(actor.id(), taskId, data.title, oldStatus, data.status);
         }
@@ -251,8 +256,10 @@ class WorkController {
         var current = new Input(task(taskId));
         var assignees = current.ids("assigneeIds");
         if (assignees.contains(actor.id())) return current.value();
+        var eligible = current.ids("eligibleAssigneeIds");
+        if (!eligible.isEmpty() && !eligible.contains(actor.id())) throw ApiError.forbidden();
         int limit = current.number("maxAssignees", 1, 100);
-        if (!current.bool("open") || assignees.size() >= limit) {
+        if (!current.text("status",1,30).equals("backlog") || !current.bool("open") || assignees.size() >= limit) {
             throw new ApiError(409, "NO_SLOTS", "Não há vagas nesta tarefa.");
         }
         db.validateMembers(List.of(actor.id()));
@@ -263,6 +270,7 @@ class WorkController {
         db.sql.update("UPDATE tasks SET assignee_ids = ?::uuid[], open = ?, status = ?, position = ?, updated_at = ? WHERE id = ?",
             Store.array(assignees), open, move ? "a_fazer" : status,
             move ? endOf("a_fazer") : current.number("order", 1, Integer.MAX_VALUE), Input.today(), taskId);
+        if (move) notifyTaskStatus(actor.id(),taskId,current.text("title",3,200),status,"a_fazer");
         return task(taskId);
     }
 
@@ -276,7 +284,7 @@ class WorkController {
         var assignees = current.ids("assigneeIds");
         if(!actor.admin()&&!assignees.contains(actor.id()))throw ApiError.forbidden();
         if (assignees.remove(actor.id())) {
-            db.sql.update("UPDATE tasks SET assignee_ids = ?::uuid[], updated_at = ? WHERE id = ?",
+            db.sql.update("UPDATE tasks SET assignee_ids = ?::uuid[], open = (status='backlog'), updated_at = ? WHERE id = ?",
                 Store.array(assignees), Input.today(), taskId);
         }
         return task(taskId);
@@ -326,21 +334,35 @@ class WorkController {
     }
 
     private record TaskData(String title, String description, UUID project, String category, String status,
-                            String priority, List<UUID> assignees, boolean open, int max, LocalDate due, String checklist) {}
+                            String priority, List<UUID> assignees, List<UUID> eligible, boolean open, int max, LocalDate due, String checklist) {}
 
-    private TaskData taskData(Input form) { return taskData(form, List.of()); }
+    private TaskData taskData(Input form) { return taskData(form, List.of(), true); }
 
     private TaskData taskData(Input form, List<UUID> oldAssignees) {
+        return taskData(form,oldAssignees,false);
+    }
+
+    private TaskData taskData(Input form, List<UUID> oldAssignees, boolean creating) {
         UUID project = form.optionalId("projectId");
         if (project != null) project(project);
         List<UUID> ids = form.ids("assigneeIds");
+        String status = form.choice("status", Input.TASK_STATUS);
+        List<UUID> eligible = form.has("eligibleAssigneeIds") ? form.ids("eligibleAssigneeIds") : List.of();
+        if (creating && status.equals("backlog")) {
+            // Older clients used assigneeIds to select invitees. They are candidates, not acceptances.
+            if (!form.has("eligibleAssigneeIds")) eligible = ids;
+            else if (!ids.isEmpty()) throw ApiError.invalid("No Backlog, use a lista de pessoas que podem aceitar e aguarde os aceites.");
+            ids = List.of();
+        }
+        db.validateMembers(eligible);
         db.validateMembers(ids.stream().filter(member -> !oldAssignees.contains(member)).toList());
         int max = form.number("maxAssignees", 1, 100);
         if (ids.size() > max) throw ApiError.invalid("O número de responsáveis excede o limite de vagas.");
-        boolean open = form.bool("open") && ids.size() < max;
+        boolean open = status.equals("backlog") && ids.size() < max;
+        if (status.equals("backlog") && ids.size() == max) status = "a_fazer";
         return new TaskData(form.text("title", 3, 200), form.text("description", 0, 12000),
-            project, form.has("category") ? form.choice("category", Input.AREAS) : project != null && !project(project).path("category").isNull() ? project(project).path("category").asText() : "programacao", form.choice("status", Input.TASK_STATUS),
-            form.choice("priority", "baixa", "media", "alta", "critica"), ids, open, max,
+            project, form.has("category") ? form.choice("category", Input.AREAS) : project != null && !project(project).path("category").isNull() ? project(project).path("category").asText() : "programacao", status,
+            form.choice("priority", "baixa", "media", "alta", "critica"), ids, eligible, open, max,
             form.optionalDate("dueDate"), checklist(form.value().path("checklist")));
     }
 

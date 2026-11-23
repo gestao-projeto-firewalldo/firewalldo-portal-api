@@ -146,3 +146,12 @@ Migração `V8__portal_v19.sql` é aditiva: não apaga dados. Desliga `radar_set
 - Variáveis opcionais: `FINANCE_INITIAL_DELAY_MS` (padrão 90000) e `FINANCE_INTERVAL_MS` (padrão 21600000).
 
 **Variáveis que deixaram de ser usadas:** `OPENAI_API_KEY`, `OPENAI_MODEL`, `RADAR_INITIAL_DELAY_MS`, `RADAR_POLL_MS`. Podem ser removidas do Railway quando quiser; mantê-las não causa problema.
+
+
+## Portal 1.1.11 — vagas do Backlog
+
+`eligibleAssigneeIds` define quem pode aceitar: uma lista vazia permite qualquer conta ativa. Essa lista pode ser maior que `maxAssignees`. `assigneeIds` contém apenas as pessoas que efetivamente aceitaram; convidar não ocupa vaga. No Backlog, o servidor mantém as inscrições abertas até completar o número de aceites, passando então para `a_fazer`. O aceite é idempotente e serializado pelo bloqueio transacional existente, inclusive com várias réplicas. Os candidatos que não aceitaram não ganham permissão de mover a tarefa.
+
+O editor usa campos separados e não permite preencher `assigneeIds` manualmente no Backlog. Para clientes antigos, ao criar uma tarefa de Backlog sem `eligibleAssigneeIds`, a antiga seleção de `assigneeIds` é interpretada como lista de candidatos e os aceites começam vazios. Nas tarefas já em execução, `assigneeIds` continua sendo a equipe responsável.
+
+A migração V10 adiciona a lista de candidatos e abre inscrições de tarefas antigas no Backlog que estavam fechadas indevidamente. Preserva os aceites e tickets existentes. Tarefas antigas de Backlog que já estavam com todas as vagas preenchidas seguem para A fazer. Migrações V1–V9 permanecem intactas.
