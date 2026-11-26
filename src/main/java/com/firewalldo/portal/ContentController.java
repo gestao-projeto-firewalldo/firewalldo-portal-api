@@ -181,7 +181,7 @@ class ContentController {
     @Transactional
     JsonNode savePreferences(@RequestAttribute Actor actor, @RequestBody JsonNode body) {
         var input = new Input(body); input.only("theme", "reducedMotion", "notifications");
-        input.choice("theme", "dark", "light", "system"); input.bool("reducedMotion");
+        input.choice("theme", "dark", "light", "system", "hybrid"); input.bool("reducedMotion");
         var alerts = new Input(body.path("notifications"));
         alerts.only("taskAssigned", "taskDue", "projectUpdates", "newsDigest", "email");
         for (String key : List.of("taskAssigned", "taskDue", "projectUpdates", "newsDigest", "email")) alerts.bool(key);
